@@ -1,6 +1,5 @@
 import json
 import math
-import os
 import select
 import sys
 import subprocess
@@ -32,7 +31,6 @@ REFRESH_SECONDS = 15
 DEFAULT_LIMIT = 12
 DEFAULT_SCAN_DEPTH = 2
 DEFAULT_REPO_LIMIT = 100
-SETTINGS_DIR_NAME = "gh-actions-monitor"
 SETTINGS_FILE_NAME = "settings.toml"
 
 STATUS_STYLE = {
@@ -106,9 +104,7 @@ def run_gh(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProc
 
 
 def default_settings_path() -> Path:
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    return base / SETTINGS_DIR_NAME / SETTINGS_FILE_NAME
+    return Path.cwd() / SETTINGS_FILE_NAME
 
 
 def load_settings_repos(path: Path) -> list[str]:

@@ -22,7 +22,7 @@ On first launch, the app opens a repository picker using repositories visible to
 your authenticated GitHub account. The selected GitHub repositories are saved to:
 
 ```text
-~/.config/gh-actions-monitor/settings.toml
+./settings.toml
 ```
 
 The file is intentionally small and editable:
