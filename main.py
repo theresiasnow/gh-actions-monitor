@@ -89,18 +89,68 @@ class KeyWatcher:
         if self._fd is not None and self._settings is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._settings)
 
-    def quit_requested(self) -> bool:
+    def suspend(self) -> None:
+        """Restore normal terminal mode (e.g. before handing off to a pager)."""
+        if self._fd is not None and self._settings is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._settings)
+
+    def resume(self) -> None:
+        """Re-enter cbreak mode after returning from a pager."""
+        if self._fd is not None:
+            tty.setcbreak(self._fd)
+
+    def read_key(self) -> str | None:
+        """Return the next key action or None if no key is waiting."""
         if self._fd is None:
-            return False
+            return None
 
         readable, _, _ = select.select([sys.stdin], [], [], 0)
         if not readable:
-            return False
-        return sys.stdin.read(1).lower() == "q"
+            return None
+
+        ch = sys.stdin.read(1)
+        if ch in ("q", "Q"):
+            return "quit"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x1b":
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if readable:
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if readable:
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == "A":
+                            return "up"
+                        if ch3 == "B":
+                            return "down"
+        return None
 
 
 def run_gh(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["gh", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def show_run_logs(console: Console, run: dict, project: Project) -> None:
+    """Display logs for a workflow run; blocks until the pager exits."""
+    run_id = run.get("databaseId")
+    if not run_id:
+        console.print("[red]No run ID available.[/]")
+        input("Press Enter to return…")
+        return
+
+    args = ["run", "view", str(run_id), "--log"]
+    if project.repo:
+        args.extend(["--repo", project.repo])
+
+    try:
+        subprocess.run(["gh", *args], cwd=project.path)
+    except FileNotFoundError:
+        console.print("[red]gh CLI not found.[/]")
+
+    console.print("\n[dim]Press Enter to return to monitor…[/]")
+    sys.stdin.readline()
 
 
 def default_settings_path() -> Path:
@@ -443,7 +493,7 @@ def project_title(group: ProjectRuns) -> Text:
     return title
 
 
-def build_project_panel(group: ProjectRuns) -> Panel:
+def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> Panel:
     if group.error:
         body = Text(group.error, style="red")
         return Panel(body, title=project_title(group), border_style="red", expand=True)
@@ -453,7 +503,8 @@ def build_project_panel(group: ProjectRuns) -> Panel:
         return Panel(body, title=project_title(group), border_style="dim", expand=True)
 
     table = Table.grid(expand=True)
-    table.add_column(width=2)
+    table.add_column(width=2)  # cursor indicator
+    table.add_column(width=2)  # status icon
     table.add_column(ratio=3)
     table.add_column(ratio=2)
     table.add_column(width=12)
@@ -462,13 +513,19 @@ def build_project_panel(group: ProjectRuns) -> Panel:
 
     for run in group.runs:
         icon, style = run_style(run)
+        is_selected = selected_id is not None and run.get("databaseId") == selected_id
+        cursor_cell = Text("▶ " if is_selected else "  ", style="bold bright_white")
         workflow = Text(run.get("workflowName") or run.get("name") or "Unnamed workflow")
         workflow.stylize("bold" if is_active(run) else style)
         branch = Text(run.get("headBranch") or "unknown", style="bright_white")
         event = Text(run.get("event") or "unknown", style="dim")
         elapsed = Text(duration(run["createdAt"], run["updatedAt"]), style="cyan")
         when = Text(time_ago(run["createdAt"]), style="dim")
-        table.add_row(Text(icon, style=style), workflow, branch, event, elapsed, when)
+        row_style = "reverse" if is_selected else ""
+        table.add_row(
+            cursor_cell, Text(icon, style=style), workflow, branch, event, elapsed, when,
+            style=row_style,
+        )
 
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
     if any(run.get("conclusion") in {"failure", "timed_out"} for run in group.runs):
@@ -478,15 +535,17 @@ def build_project_panel(group: ProjectRuns) -> Panel:
 
 
 def build_dashboard(
-    project_runs: list[ProjectRuns], last_updated: str, refresh_seconds: int
+    project_runs: list[ProjectRuns], last_updated: str, refresh_seconds: int, selected_id: int | None = None
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
     header.append(f"  updated {last_updated}", style="dim")
     header.append(f"  refresh {refresh_seconds}s", style="dim")
-    header.append("  q to quit", style="dim")
+    header.append("  ↑/↓ navigate", style="dim")
+    header.append("  Enter logs", style="dim")
+    header.append("  q quit", style="dim")
 
-    panels = [build_summary(project_runs), *[build_project_panel(group) for group in project_runs]]
+    panels = [build_summary(project_runs), *[build_project_panel(group, selected_id) for group in project_runs]]
     return Group(Align.center(header), *panels)
 
 
@@ -606,17 +665,42 @@ def main(
 def run_monitor(
     console: Console, projects: list[Project], limit: int, refresh: int
 ) -> None:
+    cursor = 0
+    groups: list[ProjectRuns] = []
+    all_runs: list[tuple[Project, dict]] = []
+
     with KeyWatcher() as keys:
         with Live(console=console, refresh_per_second=2, screen=True) as live:
             while True:
                 groups = [fetch_runs(project, limit) for project in projects]
+                all_runs = [(g.project, run) for g in groups for run in g.runs]
+                if all_runs:
+                    cursor = min(cursor, len(all_runs) - 1)
+                selected_id = all_runs[cursor][1].get("databaseId") if all_runs else None
                 now = datetime.now().strftime("%H:%M:%S")
-                live.update(build_dashboard(groups, now, refresh))
+                live.update(build_dashboard(groups, now, refresh, selected_id))
 
                 deadline = time.monotonic() + refresh
                 while time.monotonic() < deadline:
-                    if keys.quit_requested():
+                    key = keys.read_key()
+                    if key == "quit":
                         return
+                    if key == "up" and all_runs:
+                        cursor = max(0, cursor - 1)
+                        selected_id = all_runs[cursor][1].get("databaseId")
+                        live.update(build_dashboard(groups, now, refresh, selected_id))
+                    elif key == "down" and all_runs:
+                        cursor = min(len(all_runs) - 1, cursor + 1)
+                        selected_id = all_runs[cursor][1].get("databaseId")
+                        live.update(build_dashboard(groups, now, refresh, selected_id))
+                    elif key == "enter" and all_runs:
+                        project, run = all_runs[cursor]
+                        live.stop()
+                        keys.suspend()
+                        show_run_logs(console, run, project)
+                        keys.resume()
+                        live.start()
+                        live.update(build_dashboard(groups, now, refresh, selected_id))
                     time.sleep(0.1)
 
 
