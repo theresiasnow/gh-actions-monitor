@@ -69,6 +69,8 @@ class ProjectRuns:
     project: Project
     runs: list[dict]
     error: str | None = None
+    prs: list[dict] | None = None
+    pr_error: str | None = None
 
 
 class KeyWatcher:
@@ -409,6 +411,57 @@ def fetch_runs(project: Project, limit: int) -> ProjectRuns:
     return ProjectRuns(project, runs)
 
 
+def fetch_prs(project: Project, limit: int) -> tuple[list[dict], str | None]:
+    args = [
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        str(limit),
+        "--json",
+        ",".join(
+            [
+                "number",
+                "title",
+                "headRefName",
+                "isDraft",
+                "mergeStateStatus",
+                "reviewDecision",
+                "statusCheckRollup",
+                "author",
+                "updatedAt",
+                "url",
+            ]
+        ),
+    ]
+    if project.repo:
+        args.extend(["--repo", project.repo])
+
+    try:
+        result = run_gh(args, cwd=project.path)
+    except FileNotFoundError as exc:
+        missing = exc.filename or "gh"
+        return [], f"Could not run {missing}. Is GitHub CLI installed?"
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or "GitHub CLI did not return pull requests."
+        return [], message
+
+    try:
+        prs = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return [], f"Could not parse GitHub PR output: {exc}"
+
+    return prs, None
+
+
+def fetch_project_runs(project: Project, run_limit: int, pr_limit: int) -> ProjectRuns:
+    group = fetch_runs(project, run_limit)
+    prs, pr_error = fetch_prs(project, pr_limit)
+    return ProjectRuns(group.project, group.runs, group.error, prs, pr_error)
+
+
 def parse_github_time(iso: str) -> datetime:
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
@@ -445,18 +498,83 @@ def run_style(run: dict) -> tuple[str, str]:
     return STATUS_STYLE.get(status, ("?", "dim"))
 
 
+def pr_check_counts(pr: dict) -> Counter:
+    counts: Counter = Counter()
+    for check in pr.get("statusCheckRollup") or []:
+        state = normalize_check_state(check)
+        counts[str(state).lower()] += 1
+    return counts
+
+
+def normalize_check_state(check: dict) -> str:
+    conclusion = check.get("conclusion") or check.get("workflowRun", {}).get("conclusion")
+    state = check.get("state")
+    status = check.get("status") or check.get("workflowRun", {}).get("status")
+
+    if conclusion:
+        return str(conclusion).lower()
+    if state:
+        return str(state).lower()
+    if status:
+        return str(status).lower()
+    return "unknown"
+
+
+def check_progress(pr: dict) -> tuple[int, int, int, int]:
+    checks = pr_check_counts(pr)
+    total = sum(checks.values())
+    failing = (
+        checks["failure"]
+        + checks["failed"]
+        + checks["error"]
+        + checks["timed_out"]
+        + checks["action_required"]
+        + checks["cancelled"]
+    )
+    passing = checks["success"] + checks["neutral"] + checks["skipped"]
+    completed = min(total, passing + failing)
+    return completed, total, passing, failing
+
+
+def pr_status(pr: dict) -> tuple[str, str, str]:
+    completed, total, passing, failing = check_progress(pr)
+
+    if pr.get("isDraft"):
+        detail = f"{completed}/{total} checks" if total else "draft"
+        return "D", "dim", detail
+    if failing:
+        return "✗", "red", f"{completed}/{total} checks, {failing} fail"
+    if total and completed < total:
+        return "⟳", "yellow", f"{completed}/{total} checks"
+
+    review = pr.get("reviewDecision")
+    if review == "CHANGES_REQUESTED":
+        return "!", "magenta", "changes requested"
+    if review == "REVIEW_REQUIRED":
+        return "?", "cyan", "review required"
+
+    merge_state = pr.get("mergeStateStatus")
+    if merge_state in {"BLOCKED", "DIRTY", "UNKNOWN"}:
+        return "!", "magenta", merge_state.lower().replace("_", " ")
+    if total and passing == total:
+        return "✓", "green", f"{total}/{total} checks"
+    return "•", "bright_blue", (merge_state or "open").lower().replace("_", " ")
+
+
 def is_active(run: dict) -> bool:
     return run.get("status") in {"in_progress", "queued", "waiting", "requested", "pending"}
 
 
 def build_summary(project_runs: list[ProjectRuns]) -> Panel:
     runs = [run for group in project_runs for run in group.runs]
-    statuses = Counter(run.get("status", "unknown") for run in runs)
+    prs = [pr for group in project_runs for pr in group.prs or []]
     conclusions = Counter(run.get("conclusion") or "none" for run in runs)
     active = sum(1 for run in runs if is_active(run))
     failures = conclusions["failure"] + conclusions["timed_out"] + conclusions["action_required"]
+    draft_prs = sum(1 for pr in prs if pr.get("isDraft"))
 
     summary = Table.grid(expand=True)
+    summary.add_column(justify="center")
     summary.add_column(justify="center")
     summary.add_column(justify="center")
     summary.add_column(justify="center")
@@ -465,7 +583,8 @@ def build_summary(project_runs: list[ProjectRuns]) -> Panel:
         metric("Projects", str(len(project_runs)), "cyan"),
         metric("Active", str(active), "yellow" if active else "green"),
         metric("Recent failures", str(failures), "red" if failures else "green"),
-        metric("Completed", str(statuses["completed"]), "green"),
+        metric("Open PRs", str(len(prs)), "yellow" if prs else "green"),
+        metric("Draft PRs", str(draft_prs), "dim" if draft_prs else "green"),
     )
     return Panel(summary, border_style="bright_blue", padding=(1, 2))
 
@@ -488,19 +607,19 @@ def project_title(group: ProjectRuns) -> Text:
         title.append(f"  {group.project.repo}", style="dim")
     if active:
         title.append(f"  {active} active", style="yellow")
+    if group.prs:
+        title.append(f"  {len(group.prs)} PRs", style="bright_blue")
     if failures:
         title.append(f"  {failures} failing", style="red")
     return title
 
 
-def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> Panel:
+def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Table | Text:
     if group.error:
-        body = Text(group.error, style="red")
-        return Panel(body, title=project_title(group), border_style="red", expand=True)
+        return Text(group.error, style="red")
 
     if not group.runs:
-        body = Align.center(Text("No workflow runs found.", style="dim"), vertical="middle")
-        return Panel(body, title=project_title(group), border_style="dim", expand=True)
+        return Text("No workflow runs found.", style="dim")
 
     table = Table.grid(expand=True)
     table.add_column(width=2)  # cursor indicator
@@ -527,11 +646,59 @@ def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> P
             style=row_style,
         )
 
+    return table
+
+
+def build_prs_table(group: ProjectRuns) -> Table | Text | None:
+    if group.pr_error:
+        return Text(f"PRs: {group.pr_error}", style="red")
+
+    prs = group.prs or []
+    if not prs:
+        return Text("No open pull requests.", style="dim")
+
+    table = Table.grid(expand=True)
+    table.add_column(width=2)
+    table.add_column(width=8, style="cyan")
+    table.add_column(ratio=4)
+    table.add_column(ratio=2)
+    table.add_column(ratio=2)
+    table.add_column(width=12, justify="right")
+
+    for pr in prs:
+        icon, style, status = pr_status(pr)
+        author = pr.get("author") or {}
+        title = Text(pr.get("title") or "Untitled pull request")
+        title.stylize("dim" if pr.get("isDraft") else "bold")
+        branch = Text(pr.get("headRefName") or "unknown", style="bright_white")
+        updated = Text(time_ago(pr["updatedAt"]), style="dim")
+        table.add_row(
+            Text(icon, style=style),
+            f"#{pr.get('number', '?')}",
+            title,
+            Text(status, style=style),
+            Text(author.get("login") or "unknown", style="dim"),
+            updated,
+        )
+
+    return table
+
+
+def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> Panel:
+    sections: list[Table | Text | Align] = []
+    sections.append(Text("Runs", style="bold bright_white"))
+    sections.append(build_runs_table(group, selected_id))
+    sections.append(Text("Pull Requests", style="bold bright_white"))
+    sections.append(build_prs_table(group) or Text("No open pull requests.", style="dim"))
+    body = Group(*sections)
+
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
     if any(run.get("conclusion") in {"failure", "timed_out"} for run in group.runs):
         border_style = "red"
+    if group.error or group.pr_error:
+        border_style = "red"
 
-    return Panel(table, title=project_title(group), border_style=border_style, expand=True)
+    return Panel(body, title=project_title(group), border_style=border_style, expand=True)
 
 
 def build_dashboard(
@@ -610,6 +777,14 @@ def main(
             help=f"Runs to fetch per project. Default: {DEFAULT_LIMIT}.",
         ),
     ] = DEFAULT_LIMIT,
+    pr_limit: Annotated[
+        int,
+        typer.Option(
+            "--pr-limit",
+            min=1,
+            help=f"Open pull requests to fetch per project. Default: {DEFAULT_LIMIT}.",
+        ),
+    ] = DEFAULT_LIMIT,
     refresh: Annotated[
         int,
         typer.Option(
@@ -636,7 +811,7 @@ def main(
             console.print("[red]No projects found.[/]")
             return
 
-        run_monitor(console, projects, limit, refresh)
+        run_monitor(console, projects, limit, pr_limit, refresh)
         return
 
     if select:
@@ -659,11 +834,11 @@ def main(
         console.print("[red]No projects found.[/]")
         return
 
-    run_monitor(console, projects, limit, refresh)
+    run_monitor(console, projects, limit, pr_limit, refresh)
 
 
 def run_monitor(
-    console: Console, projects: list[Project], limit: int, refresh: int
+    console: Console, projects: list[Project], limit: int, pr_limit: int, refresh: int
 ) -> None:
     cursor = 0
     groups: list[ProjectRuns] = []
@@ -672,7 +847,7 @@ def run_monitor(
     with KeyWatcher() as keys:
         with Live(console=console, refresh_per_second=2, screen=True) as live:
             while True:
-                groups = [fetch_runs(project, limit) for project in projects]
+                groups = [fetch_project_runs(project, limit, pr_limit) for project in projects]
                 all_runs = [(g.project, run) for g in groups for run in g.runs]
                 if all_runs:
                     cursor = min(cursor, len(all_runs) - 1)
