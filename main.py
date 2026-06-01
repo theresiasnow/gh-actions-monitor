@@ -520,6 +520,34 @@ def normalize_check_state(check: dict) -> str:
     return "unknown"
 
 
+def normalize_run_state(run: dict) -> str:
+    status = run.get("status") or "unknown"
+    conclusion = run.get("conclusion")
+    if status == "completed" and conclusion:
+        return str(conclusion).lower()
+    return str(status).lower()
+
+
+def visible_run_check_counts(pr: dict, runs: list[dict]) -> Counter:
+    branch = pr.get("headRefName")
+    if not branch:
+        return Counter()
+
+    counts: Counter = Counter()
+    for run in runs:
+        if run.get("headBranch") == branch:
+            counts[normalize_run_state(run)] += 1
+    return counts
+
+
+def pr_progress_counts(pr: dict, runs: list[dict] | None = None) -> Counter:
+    if runs is not None:
+        visible_counts = visible_run_check_counts(pr, runs)
+        if visible_counts:
+            return visible_counts
+    return pr_check_counts(pr)
+
+
 def check_progress(checks: Counter) -> tuple[int, int, int, int]:
     total = sum(checks.values())
     failing = (
@@ -535,8 +563,8 @@ def check_progress(checks: Counter) -> tuple[int, int, int, int]:
     return completed, total, passing, failing
 
 
-def pr_status(pr: dict) -> tuple[str, str, str]:
-    completed, total, passing, failing = check_progress(pr_check_counts(pr))
+def pr_status(pr: dict, runs: list[dict] | None = None) -> tuple[str, str, str]:
+    completed, total, passing, failing = check_progress(pr_progress_counts(pr, runs))
     check_detail = f"{completed}/{total} checks" if total else None
 
     if pr.get("isDraft"):
@@ -671,7 +699,7 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
     table.add_column(width=12, justify="right")
 
     for pr in prs:
-        icon, style, status = pr_status(pr)
+        icon, style, status = pr_status(pr, group.runs)
         author = pr.get("author") or {}
         title = Text(pr.get("title") or "Untitled pull request")
         title.stylize("dim" if pr.get("isDraft") else "bold")
