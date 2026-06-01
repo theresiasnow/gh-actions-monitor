@@ -528,21 +528,16 @@ def normalize_run_state(run: dict) -> str:
     return str(status).lower()
 
 
-def visible_run_check_counts(pr: dict, runs: list[dict]) -> Counter:
-    branch = pr.get("headRefName")
-    if not branch:
-        return Counter()
-
+def visible_run_check_counts(runs: list[dict]) -> Counter:
     counts: Counter = Counter()
     for run in runs:
-        if run.get("headBranch") == branch:
-            counts[normalize_run_state(run)] += 1
+        counts[normalize_run_state(run)] += 1
     return counts
 
 
 def pr_progress_counts(pr: dict, runs: list[dict] | None = None) -> Counter:
     if runs is not None:
-        visible_counts = visible_run_check_counts(pr, runs)
+        visible_counts = visible_run_check_counts(runs)
         if visible_counts:
             return visible_counts
     return pr_check_counts(pr)
