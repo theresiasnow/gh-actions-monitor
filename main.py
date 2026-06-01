@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import select
 import sys
 import subprocess
@@ -520,8 +521,27 @@ def normalize_check_state(check: dict) -> str:
     return "unknown"
 
 
-def check_progress(pr: dict) -> tuple[int, int, int, int]:
-    checks = pr_check_counts(pr)
+def check_name(check: dict) -> str:
+    workflow_run = check.get("workflowRun") or {}
+    return " ".join(
+        str(value)
+        for value in (
+            check.get("name"),
+            check.get("context"),
+            workflow_run.get("name"),
+            workflow_run.get("workflowName"),
+        )
+        if value
+    )
+
+
+def is_unit_test_check(check: dict) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", check_name(check).lower())
+    compact = normalized.replace(" ", "")
+    return "unittest" in compact or ("unit" in normalized and "test" in normalized)
+
+
+def check_progress(checks: Counter) -> tuple[int, int, int, int]:
     total = sum(checks.values())
     failing = (
         checks["failure"]
@@ -536,16 +556,41 @@ def check_progress(pr: dict) -> tuple[int, int, int, int]:
     return completed, total, passing, failing
 
 
+def unit_test_check_counts(pr: dict) -> Counter:
+    counts: Counter = Counter()
+    for check in pr.get("statusCheckRollup") or []:
+        if is_unit_test_check(check):
+            counts[normalize_check_state(check)] += 1
+    return counts
+
+
+def unit_test_progress_detail(pr: dict) -> str | None:
+    completed, total, _, _ = check_progress(unit_test_check_counts(pr))
+    if not total:
+        return None
+    return f"{completed}/{total} unit tests"
+
+
 def pr_status(pr: dict) -> tuple[str, str, str]:
-    completed, total, passing, failing = check_progress(pr)
+    _, total, passing, failing = check_progress(pr_check_counts(pr))
+    _, _, _, unit_failing = check_progress(unit_test_check_counts(pr))
+    unit_detail = unit_test_progress_detail(pr)
 
     if pr.get("isDraft"):
-        detail = f"{completed}/{total} checks" if total else "draft"
+        detail = unit_detail or "draft"
         return "D", "dim", detail
     if failing:
-        return "✗", "red", f"{completed}/{total} checks, {failing} fail"
-    if total and completed < total:
-        return "⟳", "yellow", f"{completed}/{total} checks"
+        if unit_detail and unit_failing:
+            detail = unit_detail
+        else:
+            detail = "check failing" if failing == 1 else f"{failing} checks failing"
+        return "✗", "red", detail
+    if unit_detail:
+        completed, unit_total, _, _ = check_progress(unit_test_check_counts(pr))
+        if completed < unit_total:
+            return "⟳", "yellow", unit_detail
+    if total and passing < total:
+        return "⟳", "yellow", "checks pending"
 
     review = pr.get("reviewDecision")
     if review == "CHANGES_REQUESTED":
@@ -557,7 +602,7 @@ def pr_status(pr: dict) -> tuple[str, str, str]:
     if merge_state in {"BLOCKED", "DIRTY", "UNKNOWN"}:
         return "!", "magenta", merge_state.lower().replace("_", " ")
     if total and passing == total:
-        return "✓", "green", f"{total}/{total} checks"
+        return "✓", "green", unit_detail or "checks passing"
     return "•", "bright_blue", (merge_state or "open").lower().replace("_", " ")
 
 
