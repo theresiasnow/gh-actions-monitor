@@ -520,12 +520,36 @@ def normalize_check_state(check: dict) -> str:
     return "unknown"
 
 
+def check_name(check: dict) -> str:
+    workflow_run = check.get("workflowRun") or {}
+    return (
+        check.get("name")
+        or check.get("context")
+        or workflow_run.get("name")
+        or workflow_run.get("workflowName")
+        or "Unnamed check"
+    )
+
+
+def check_style(state: str) -> tuple[str, str]:
+    if state in CONCLUSION_STYLE:
+        return CONCLUSION_STYLE[state]
+    return STATUS_STYLE.get(state, ("?", "dim"))
+
+
 def normalize_run_state(run: dict) -> str:
     status = run.get("status") or "unknown"
     conclusion = run.get("conclusion")
     if status == "completed" and conclusion:
         return str(conclusion).lower()
     return str(status).lower()
+
+
+def related_pr_runs(pr: dict, runs: list[dict]) -> list[dict]:
+    branch = pr.get("headRefName")
+    if not branch:
+        return []
+    return [run for run in runs if run.get("headBranch") == branch]
 
 
 def visible_run_check_counts(runs: list[dict]) -> Counter:
@@ -694,11 +718,11 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
     table.add_column(width=12, justify="right")
 
     for pr in prs:
-        icon, style, status = pr_status(pr, group.runs)
+        runs = related_pr_runs(pr, group.runs)
+        icon, style, status = pr_status(pr, runs)
         author = pr.get("author") or {}
         title = Text(pr.get("title") or "Untitled pull request")
         title.stylize("dim" if pr.get("isDraft") else "bold")
-        branch = Text(pr.get("headRefName") or "unknown", style="bright_white")
         updated = Text(time_ago(pr["updatedAt"]), style="dim")
         table.add_row(
             Text(icon, style=style),
@@ -708,6 +732,36 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
             Text(author.get("login") or "unknown", style="dim"),
             updated,
         )
+        if runs:
+            for run in runs:
+                run_icon, run_style_name = run_style(run)
+                workflow = Text(
+                    f"  ↳ {run.get('workflowName') or run.get('name') or 'Unnamed workflow'}",
+                    style="dim",
+                )
+                if is_active(run):
+                    workflow.stylize("yellow")
+                table.add_row(
+                    Text(run_icon, style=run_style_name),
+                    "",
+                    workflow,
+                    Text(run.get("event") or "workflow", style="dim"),
+                    Text(run.get("headBranch") or "unknown", style="bright_white"),
+                    Text(time_ago(run["createdAt"]), style="dim"),
+                )
+            continue
+
+        for check in pr.get("statusCheckRollup") or []:
+            state = normalize_check_state(check)
+            check_icon, check_style_name = check_style(state)
+            table.add_row(
+                Text(check_icon, style=check_style_name),
+                "",
+                Text(f"  ↳ {check_name(check)}", style="dim"),
+                Text(state.replace("_", " "), style=check_style_name),
+                Text("check", style="dim"),
+                "",
+            )
 
     return table
 
