@@ -547,9 +547,23 @@ def normalize_run_state(run: dict) -> str:
 
 def related_pr_runs(pr: dict, runs: list[dict]) -> list[dict]:
     branch = pr.get("headRefName")
-    if not branch:
-        return []
-    return [run for run in runs if run.get("headBranch") == branch]
+    pull_ref = f"refs/pull/{pr.get('number')}/head" if pr.get("number") else None
+    related: list[dict] = []
+    for run in runs:
+        head_branch = run.get("headBranch")
+        if head_branch == branch or (pull_ref and head_branch == pull_ref):
+            related.append(run)
+    return related
+
+
+def pr_related_run_ids(group: ProjectRuns) -> set[int]:
+    related_ids: set[int] = set()
+    for pr in group.prs or []:
+        for run in related_pr_runs(pr, group.runs):
+            run_id = run.get("databaseId")
+            if isinstance(run_id, int):
+                related_ids.add(run_id)
+    return related_ids
 
 
 def visible_run_check_counts(runs: list[dict]) -> Counter:
@@ -670,8 +684,15 @@ def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Tabl
     if group.error:
         return Text(group.error, style="red")
 
-    if not group.runs:
-        return Text("No workflow runs found.", style="dim")
+    related_ids = pr_related_run_ids(group)
+    runs = [
+        run
+        for run in group.runs
+        if not isinstance(run.get("databaseId"), int) or run["databaseId"] not in related_ids
+    ]
+
+    if not runs:
+        return Text("No standalone workflow runs found.", style="dim")
 
     table = Table.grid(expand=True)
     table.add_column(width=2)  # cursor indicator
@@ -682,7 +703,7 @@ def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Tabl
     table.add_column(width=11, justify="right")
     table.add_column(width=9, justify="right")
 
-    for run in group.runs:
+    for run in runs:
         icon, style = run_style(run)
         is_selected = selected_id is not None and run.get("databaseId") == selected_id
         cursor_cell = Text("▶ " if is_selected else "  ", style="bold bright_white")
