@@ -62,6 +62,8 @@ class Project:
     name: str
     path: Path
     repo: str | None = None
+    local: bool = False
+    """True when ``path`` is this project's own checkout rather than a fallback."""
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,17 @@ class ProjectRuns:
     error: str | None = None
     prs: list[dict] | None = None
     pr_error: str | None = None
+    worktrees: list[dict] | None = None
+    default_branch: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentBranch:
+    name: str
+    is_worktree: bool
+    path: str | None
+    pr: dict | None
+    runs: list[dict]
 
 
 class KeyWatcher:
@@ -218,6 +231,56 @@ def remote_repo(path: Path) -> str | None:
     return remote.removesuffix(".git").strip("/") or None
 
 
+def parse_worktree_list(output: str) -> list[dict]:
+    """Parse `git worktree list --porcelain` into path/branch records."""
+    worktrees: list[dict] = []
+    current: dict = {}
+
+    for line in output.splitlines():
+        if not line.strip():
+            if current.get("path"):
+                worktrees.append({"path": current["path"], "branch": current.get("branch")})
+            current = {}
+            continue
+        if line.startswith("worktree "):
+            current = {"path": line.removeprefix("worktree ").strip()}
+        elif line.startswith("branch "):
+            ref = line.removeprefix("branch ").strip()
+            current["branch"] = ref.removeprefix("refs/heads/")
+
+    if current.get("path"):
+        worktrees.append({"path": current["path"], "branch": current.get("branch")})
+    return worktrees
+
+
+def fetch_worktrees(path: Path) -> list[dict]:
+    """List worktrees for a local repository; empty when the path is not one."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+
+    if result.returncode != 0:
+        return []
+    return parse_worktree_list(result.stdout)
+
+
+def project_worktrees(project: Project) -> list[dict]:
+    """Worktrees for a project checked out locally.
+
+    Repo-only projects (``--mine`` or ``OWNER/REPO`` arguments) carry the
+    current directory as their path, so they would otherwise report the
+    monitor's own worktrees as if they belonged to that repository.
+    """
+    if not project.local:
+        return []
+    return fetch_worktrees(project.path)
+
+
 def repos_for_authenticated_user(repo_limit: int) -> list[Project]:
     if repo_limit < 1:
         return []
@@ -346,7 +409,7 @@ def discover_projects(
             if len(project_path.relative_to(base).parts) > depth:
                 continue
             repo = remote_repo(project_path)
-            discovered[project_path] = Project(project_path.name, project_path, repo)
+            discovered[project_path] = Project(project_path.name, project_path, repo, local=True)
 
     for value in paths or ([] if scan or mine else ["."]):
         path = Path(value).expanduser()
@@ -357,9 +420,11 @@ def discover_projects(
             discovered[value] = Project(value, Path.cwd(), value)
             continue
 
-        root = git_root(path.resolve()) or path.resolve()
+        root = git_root(path.resolve())
+        is_local = root is not None
+        root = root or path.resolve()
         repo = remote_repo(root)
-        discovered[root] = Project(root.name, root, repo)
+        discovered[root] = Project(root.name, root, repo, local=is_local)
 
     return sorted(discovered.values(), key=lambda project: project.name.lower())
 
@@ -459,7 +524,11 @@ def fetch_prs(project: Project, limit: int) -> tuple[list[dict], str | None]:
 def fetch_project_runs(project: Project, run_limit: int, pr_limit: int) -> ProjectRuns:
     group = fetch_runs(project, run_limit)
     prs, pr_error = fetch_prs(project, pr_limit)
-    return ProjectRuns(group.project, group.runs, group.error, prs, pr_error)
+    worktrees = project_worktrees(project)
+    default_branch = default_branch_name(project.path) if project.local else None
+    return ProjectRuns(
+        group.project, group.runs, group.error, prs, pr_error, worktrees, default_branch
+    )
 
 
 def parse_github_time(iso: str) -> datetime:
@@ -627,6 +696,72 @@ def pr_status(pr: dict, runs: list[dict] | None = None) -> tuple[str, str, str]:
     return "•", "bright_blue", (merge_state or "open").lower().replace("_", " ")
 
 
+def runs_for_branch(branch: str, runs: list[dict]) -> list[dict]:
+    return [run for run in runs if run.get("headBranch") == branch]
+
+
+def build_agent_rows(group: ProjectRuns) -> list[AgentBranch]:
+    """Local worktrees first, then branches that only exist as open PRs."""
+    prs_by_branch = {
+        pr.get("headRefName"): pr for pr in group.prs or [] if pr.get("headRefName")
+    }
+
+    worktree_rows: list[AgentBranch] = []
+    seen: set[str] = set()
+    for worktree in group.worktrees or []:
+        branch = worktree.get("branch")
+        if not branch or branch in seen:
+            continue
+        seen.add(branch)
+        pr = prs_by_branch.get(branch)
+        runs = related_pr_runs(pr, group.runs) if pr else runs_for_branch(branch, group.runs)
+        worktree_rows.append(
+            AgentBranch(branch, True, worktree.get("path"), pr, runs)
+        )
+
+    remote_rows = [
+        AgentBranch(branch, False, None, pr, related_pr_runs(pr, group.runs))
+        for branch, pr in prs_by_branch.items()
+        if branch not in seen
+    ]
+
+    worktree_rows.sort(key=lambda row: row.name.lower())
+    remote_rows.sort(key=lambda row: row.name.lower())
+    return worktree_rows + remote_rows
+
+
+def agent_detail(row: AgentBranch, default_branch: str | None) -> str:
+    """Detail text for a branch with no open pull request."""
+    if row.name == default_branch or not row.runs:
+        return ""
+    return "local only"
+
+
+def default_branch_name(path: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(path), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip().removeprefix("origin/") or None
+
+
+def agent_test_status(row: AgentBranch) -> tuple[str, str]:
+    """Summarize CI for a branch as a short label and style."""
+    counts = visible_run_check_counts(row.runs) if row.runs else pr_check_counts(row.pr or {})
+    completed, total, _, failing = check_progress(counts)
+
+    if not total:
+        return ("—", "dim") if row.pr else ("clean", "dim")
+    if failing:
+        return "tests ✗", "red"
+    if completed < total:
+        return "tests ⟳", "yellow"
+    return "tests ✓", "green"
+
+
 def is_active(run: dict) -> bool:
     return run.get("status") in {"in_progress", "queued", "waiting", "requested", "pending"}
 
@@ -787,12 +922,46 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
     return table
 
 
+def build_agents_table(group: ProjectRuns) -> Table | Text:
+    rows = build_agent_rows(group)
+    if not rows:
+        return Text("No worktrees or PR branches.", style="dim")
+
+    table = Table.grid(expand=True)
+    table.add_column(width=2)
+    table.add_column(ratio=3)
+    table.add_column(width=9)
+    table.add_column(width=8, style="cyan")
+    table.add_column(ratio=2)
+    table.add_column(width=10)
+
+    for row in rows:
+        test_label, test_style = agent_test_status(row)
+        marker = Text("⎇ " if row.is_worktree else "  ", style="bright_black")
+        name = Text(row.name, style="bright_white" if row.is_worktree else "dim")
+
+        if row.pr:
+            _, pr_style, pr_detail = pr_status(row.pr, row.runs)
+            pr_cell = Text(f"#{row.pr.get('number', '?')}", style="cyan")
+            detail = Text(pr_detail, style=pr_style)
+        else:
+            pr_cell = Text("")
+            detail = Text(agent_detail(row, group.default_branch), style="dim")
+
+        origin = Text("worktree" if row.is_worktree else "remote", style="dim")
+        table.add_row(marker, name, Text(test_label, style=test_style), pr_cell, detail, origin)
+
+    return table
+
+
 def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
     sections.append(build_runs_table(group, selected_id))
     sections.append(Text("Pull Requests", style="bold bright_white"))
     sections.append(build_prs_table(group) or Text("No open pull requests.", style="dim"))
+    sections.append(Text("Agents", style="bold bright_white"))
+    sections.append(build_agents_table(group))
     body = Group(*sections)
 
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
