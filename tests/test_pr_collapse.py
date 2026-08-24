@@ -162,3 +162,37 @@ class TestTitleTruncation:
 
         assert len(body) == 1
         assert "…" in body[0]
+
+
+def render_ansi(table: object, width: int = 100) -> str:
+    output = io.StringIO()
+    Console(file=output, width=width, force_terminal=True, color_system="truecolor").print(table)
+    return output.getvalue()
+
+
+class TestSelectedRowRendering:
+    def test_selected_row_does_not_invert_cell_colours(self) -> None:
+        output = render_ansi(build_prs_table(group_with_two_prs(), selected_pr=22))
+
+        # `reverse` (SGR 7) turns each cell's own foreground colour into a
+        # background block, so the selected row renders as a patchwork.
+        assert "\x1b[7m" not in output
+
+    def test_selected_row_occupies_a_single_line(self) -> None:
+        pr = pull_request(
+            44,
+            "feat/long",
+            statusCheckRollup=[
+                {"name": f"Check {i}", "conclusion": "FAILURE", "status": "COMPLETED"}
+                for i in range(10)
+            ],
+        )
+        group = ProjectRuns(project(), runs=[], prs=[pr])
+
+        lines = [
+            line
+            for line in render(build_prs_table(group, selected_pr=44)).splitlines()
+            if line.strip()
+        ]
+
+        assert len(lines) == 1, lines

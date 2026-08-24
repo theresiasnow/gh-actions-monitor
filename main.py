@@ -33,6 +33,11 @@ DEFAULT_SCAN_DEPTH = 2
 DEFAULT_REPO_LIMIT = 100
 SETTINGS_FILE_NAME = "settings.toml"
 
+# Highlight the selected row with a background colour rather than `reverse`:
+# reverse inverts each cell separately, turning per-cell foreground colours
+# (green ticks, red failures, dim metadata) into clashing background blocks.
+SELECTED_ROW_STYLE = "on grey30"
+
 STATUS_STYLE = {
     "completed": ("✓", "green"),
     "in_progress": ("⟳", "yellow"),
@@ -882,7 +887,7 @@ def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Tabl
         event = Text(run.get("event") or "unknown", style="dim")
         elapsed = Text(duration(run["createdAt"], run["updatedAt"]), style="cyan")
         when = Text(time_ago(run["createdAt"]), style="dim")
-        row_style = "reverse" if is_selected else ""
+        row_style = SELECTED_ROW_STYLE if is_selected else ""
         table.add_row(
             cursor_cell, Text(icon, style=style), workflow, branch, event, elapsed, when,
             style=row_style,
@@ -944,10 +949,10 @@ def build_prs_table(
             Text(icon, style=style),
             f"#{number if number is not None else '?'}",
             title,
-            Text(status, style=style),
+            Text(status, style=style, overflow="ellipsis", no_wrap=True),
             Text(author.get("login") or "unknown", style="dim"),
             updated,
-            style="reverse" if is_selected else "",
+            style=SELECTED_ROW_STYLE if is_selected else "",
         )
 
         if not is_expanded:
@@ -974,7 +979,7 @@ def build_prs_table(
                     Text(run.get("event") or "workflow", style="dim"),
                     Text(run.get("headBranch") or "unknown", style="bright_white"),
                     Text(time_ago(run["createdAt"]), style="dim"),
-                    style="reverse" if run_selected else "",
+                    style=SELECTED_ROW_STYLE if run_selected else "",
                 )
             continue
 
