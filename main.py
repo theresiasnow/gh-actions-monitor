@@ -86,6 +86,16 @@ class AgentBranch:
     runs: list[dict]
 
 
+@dataclass(frozen=True)
+class SelectableRow:
+    """A cursor stop in the dashboard: a standalone run, or a pull request."""
+
+    kind: str  # "run" or "pr"
+    project: Project
+    run: dict | None = None
+    pr: dict | None = None
+
+
 class KeyWatcher:
     def __init__(self) -> None:
         self._fd: int | None = None
@@ -128,6 +138,8 @@ class KeyWatcher:
             return "quit"
         if ch in ("\r", "\n"):
             return "enter"
+        if ch == " ":
+            return "toggle"
         if ch == "\x1b":
             readable, _, _ = select.select([sys.stdin], [], [], 0.05)
             if readable:
@@ -815,16 +827,38 @@ def project_title(group: ProjectRuns) -> Text:
     return title
 
 
-def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Table | Text:
-    if group.error:
-        return Text(group.error, style="red")
-
+def standalone_runs(group: ProjectRuns) -> list[dict]:
+    """Runs not already nested under a pull request."""
     related_ids = pr_related_run_ids(group)
-    runs = [
+    return [
         run
         for run in group.runs
         if not isinstance(run.get("databaseId"), int) or run["databaseId"] not in related_ids
     ]
+
+
+def selectable_rows(
+    groups: list[ProjectRuns], expanded_prs: set[int] | None = None
+) -> list[SelectableRow]:
+    """Cursor stops in dashboard order; a PR's runs are stops only while expanded."""
+    expanded = expanded_prs or set()
+    rows: list[SelectableRow] = []
+    for group in groups:
+        for run in standalone_runs(group):
+            rows.append(SelectableRow("run", group.project, run=run))
+        for pr in group.prs or []:
+            rows.append(SelectableRow("pr", group.project, pr=pr))
+            if pr.get("number") in expanded:
+                for run in related_pr_runs(pr, group.runs):
+                    rows.append(SelectableRow("run", group.project, run=run, pr=pr))
+    return rows
+
+
+def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Table | Text:
+    if group.error:
+        return Text(group.error, style="red")
+
+    runs = standalone_runs(group)
 
     if not runs:
         return Text("No standalone workflow runs found.", style="dim")
@@ -857,7 +891,12 @@ def build_runs_table(group: ProjectRuns, selected_id: int | None = None) -> Tabl
     return table
 
 
-def build_prs_table(group: ProjectRuns) -> Table | Text | None:
+def build_prs_table(
+    group: ProjectRuns,
+    expanded_prs: set[int] | None = None,
+    selected_pr: int | None = None,
+    selected_id: int | None = None,
+) -> Table | Text | None:
     if group.pr_error:
         return Text(f"PRs: {group.pr_error}", style="red")
 
@@ -865,8 +904,12 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
     if not prs:
         return Text("No open pull requests.", style="dim")
 
+    expanded = expanded_prs or set()
+
     table = Table.grid(expand=True)
-    table.add_column(width=2)
+    table.add_column(width=2)  # cursor indicator
+    table.add_column(width=2)  # disclosure marker
+    table.add_column(width=2)  # status icon
     table.add_column(width=8, style="cyan")
     table.add_column(ratio=4)
     table.add_column(ratio=2)
@@ -875,19 +918,41 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
 
     for pr in prs:
         runs = related_pr_runs(pr, group.runs)
+        number = pr.get("number")
+        is_expanded = number in expanded
+        children = bool(runs or pr.get("statusCheckRollup"))
         icon, style, status = pr_status(pr, runs)
         author = pr.get("author") or {}
-        title = Text(pr.get("title") or "Untitled pull request")
+        title = Text(
+            pr.get("title") or "Untitled pull request",
+            overflow="ellipsis",
+            no_wrap=True,
+        )
         title.stylize("dim" if pr.get("isDraft") else "bold")
         updated = Text(time_ago(pr["updatedAt"]), style="dim")
+
+        is_selected = selected_pr is not None and number == selected_pr
+        cursor_cell = Text("▶ " if is_selected else "  ", style="bold bright_white")
+        if children:
+            marker = Text("▾ " if is_expanded else "▸ ", style="bright_black")
+        else:
+            marker = Text("  ")
+
         table.add_row(
+            cursor_cell,
+            marker,
             Text(icon, style=style),
-            f"#{pr.get('number', '?')}",
+            f"#{number if number is not None else '?'}",
             title,
             Text(status, style=style),
             Text(author.get("login") or "unknown", style="dim"),
             updated,
+            style="reverse" if is_selected else "",
         )
+
+        if not is_expanded:
+            continue
+
         if runs:
             for run in runs:
                 run_icon, run_style_name = run_style(run)
@@ -897,13 +962,19 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
                 )
                 if is_active(run):
                     workflow.stylize("yellow")
+                run_selected = (
+                    selected_id is not None and run.get("databaseId") == selected_id
+                )
                 table.add_row(
+                    Text("▶ " if run_selected else "  ", style="bold bright_white"),
+                    Text("  "),
                     Text(run_icon, style=run_style_name),
                     "",
                     workflow,
                     Text(run.get("event") or "workflow", style="dim"),
                     Text(run.get("headBranch") or "unknown", style="bright_white"),
                     Text(time_ago(run["createdAt"]), style="dim"),
+                    style="reverse" if run_selected else "",
                 )
             continue
 
@@ -911,6 +982,8 @@ def build_prs_table(group: ProjectRuns) -> Table | Text | None:
             state = normalize_check_state(check)
             check_icon, check_style_name = check_style(state)
             table.add_row(
+                Text("  "),
+                Text("  "),
                 Text(check_icon, style=check_style_name),
                 "",
                 Text(f"  ↳ {check_name(check)}", style="dim"),
@@ -954,12 +1027,20 @@ def build_agents_table(group: ProjectRuns) -> Table | Text:
     return table
 
 
-def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> Panel:
+def build_project_panel(
+    group: ProjectRuns,
+    selected_id: int | None = None,
+    expanded_prs: set[int] | None = None,
+    selected_pr: int | None = None,
+) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
     sections.append(build_runs_table(group, selected_id))
     sections.append(Text("Pull Requests", style="bold bright_white"))
-    sections.append(build_prs_table(group) or Text("No open pull requests.", style="dim"))
+    sections.append(
+        build_prs_table(group, expanded_prs, selected_pr, selected_id)
+        or Text("No open pull requests.", style="dim")
+    )
     sections.append(Text("Agents", style="bold bright_white"))
     sections.append(build_agents_table(group))
     body = Group(*sections)
@@ -974,17 +1055,29 @@ def build_project_panel(group: ProjectRuns, selected_id: int | None = None) -> P
 
 
 def build_dashboard(
-    project_runs: list[ProjectRuns], last_updated: str, refresh_seconds: int, selected_id: int | None = None
+    project_runs: list[ProjectRuns],
+    last_updated: str,
+    refresh_seconds: int,
+    selected_id: int | None = None,
+    expanded_prs: set[int] | None = None,
+    selected_pr: int | None = None,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
     header.append(f"  updated {last_updated}", style="dim")
     header.append(f"  refresh {refresh_seconds}s", style="dim")
     header.append("  ↑/↓ navigate", style="dim")
+    header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
     header.append("  q quit", style="dim")
 
-    panels = [build_summary(project_runs), *[build_project_panel(group, selected_id) for group in project_runs]]
+    panels = [
+        build_summary(project_runs),
+        *[
+            build_project_panel(group, selected_id, expanded_prs, selected_pr)
+            for group in project_runs
+        ],
+    ]
     return Group(Align.center(header), *panels)
 
 
@@ -1113,41 +1206,93 @@ def run_monitor(
     console: Console, projects: list[Project], limit: int, pr_limit: int, refresh: int
 ) -> None:
     cursor = 0
+    expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
-    all_runs: list[tuple[Project, dict]] = []
 
     with KeyWatcher() as keys:
         with Live(console=console, refresh_per_second=2, screen=True) as live:
             while True:
                 groups = [fetch_project_runs(project, limit, pr_limit) for project in projects]
-                all_runs = [(g.project, run) for g in groups for run in g.runs]
-                if all_runs:
-                    cursor = min(cursor, len(all_runs) - 1)
-                selected_id = all_runs[cursor][1].get("databaseId") if all_runs else None
                 now = datetime.now().strftime("%H:%M:%S")
-                live.update(build_dashboard(groups, now, refresh, selected_id))
+
+                def render() -> None:
+                    rows = selectable_rows(groups, expanded_prs)
+                    selected = rows[cursor] if rows else None
+                    live.update(
+                        build_dashboard(
+                            groups,
+                            now,
+                            refresh,
+                            selected.run.get("databaseId")
+                            if selected and selected.run
+                            else None,
+                            expanded_prs,
+                            selected.pr.get("number")
+                            if selected and selected.kind == "pr" and selected.pr
+                            else None,
+                        )
+                    )
+
+                rows = selectable_rows(groups, expanded_prs)
+                if rows:
+                    cursor = min(cursor, len(rows) - 1)
+                render()
 
                 deadline = time.monotonic() + refresh
                 while time.monotonic() < deadline:
                     key = keys.read_key()
+                    rows = selectable_rows(groups, expanded_prs)
                     if key == "quit":
                         return
-                    if key == "up" and all_runs:
+                    if key == "up" and rows:
                         cursor = max(0, cursor - 1)
-                        selected_id = all_runs[cursor][1].get("databaseId")
-                        live.update(build_dashboard(groups, now, refresh, selected_id))
-                    elif key == "down" and all_runs:
-                        cursor = min(len(all_runs) - 1, cursor + 1)
-                        selected_id = all_runs[cursor][1].get("databaseId")
-                        live.update(build_dashboard(groups, now, refresh, selected_id))
-                    elif key == "enter" and all_runs:
-                        project, run = all_runs[cursor]
-                        live.stop()
-                        keys.suspend()
-                        show_run_logs(console, run, project)
-                        keys.resume()
-                        live.start()
-                        live.update(build_dashboard(groups, now, refresh, selected_id))
+                        render()
+                    elif key == "down" and rows:
+                        cursor = min(len(rows) - 1, cursor + 1)
+                        render()
+                    elif key == "toggle" and rows:
+                        selected = rows[cursor]
+                        number = selected.pr.get("number") if selected.pr else None
+                        if isinstance(number, int):
+                            if selected.kind == "pr" and number in expanded_prs:
+                                expanded_prs.discard(number)
+                            else:
+                                # Collapsing from a child run puts the cursor
+                                # back on its pull request.
+                                if selected.kind == "run":
+                                    expanded_prs.discard(number)
+                                    cursor = next(
+                                        (
+                                            i
+                                            for i, row in enumerate(
+                                                selectable_rows(groups, expanded_prs)
+                                            )
+                                            if row.kind == "pr"
+                                            and row.pr
+                                            and row.pr.get("number") == number
+                                        ),
+                                        cursor,
+                                    )
+                                else:
+                                    expanded_prs.add(number)
+                            new_rows = selectable_rows(groups, expanded_prs)
+                            if new_rows:
+                                cursor = min(cursor, len(new_rows) - 1)
+                            render()
+                    elif key == "enter" and rows:
+                        selected = rows[cursor]
+                        if selected.kind == "run" and selected.run:
+                            live.stop()
+                            keys.suspend()
+                            show_run_logs(console, selected.run, selected.project)
+                            keys.resume()
+                            live.start()
+                            render()
+                        elif selected.pr:
+                            number = selected.pr.get("number")
+                            if isinstance(number, int):
+                                expanded_prs.symmetric_difference_update({number})
+                                render()
                     time.sleep(0.1)
 
 
