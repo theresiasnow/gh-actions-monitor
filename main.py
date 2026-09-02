@@ -460,6 +460,7 @@ def fetch_runs(project: Project, limit: int) -> ProjectRuns:
                 "conclusion",
                 "name",
                 "headBranch",
+                "headSha",
                 "event",
                 "createdAt",
                 "updatedAt",
@@ -509,6 +510,7 @@ def fetch_prs(project: Project, limit: int) -> tuple[list[dict], str | None]:
                 "title",
                 "body",
                 "headRefName",
+                "headRefOid",
                 "isDraft",
                 "mergeStateStatus",
                 "reviewDecision",
@@ -659,13 +661,22 @@ def normalize_run_state(run: dict) -> str:
 
 
 def related_pr_runs(pr: dict, runs: list[dict]) -> list[dict]:
+    # A push leaves the previous commit's runs on the branch, so matching on
+    # the branch alone drags a superseded failure into a PR that is now fine.
+    # Keep only the head commit's runs; a run or a PR that does not report a
+    # commit is kept, since there is nothing to contradict.
     branch = pr.get("headRefName")
     pull_ref = f"refs/pull/{pr.get('number')}/head" if pr.get("number") else None
+    head_sha = pr.get("headRefOid")
     related: list[dict] = []
     for run in runs:
         head_branch = run.get("headBranch")
-        if head_branch == branch or (pull_ref and head_branch == pull_ref):
-            related.append(run)
+        if head_branch != branch and not (pull_ref and head_branch == pull_ref):
+            continue
+        run_sha = run.get("headSha")
+        if head_sha and run_sha and run_sha != head_sha:
+            continue
+        related.append(run)
     return related
 
 
