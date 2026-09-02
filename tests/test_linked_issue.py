@@ -90,7 +90,7 @@ class TestIssuePrefixInTable:
 
         output = render(build_prs_table(group))
 
-        assert "#1577 PR 1603" in output
+        assert "#1577: PR 1603" in output
 
     def test_pull_request_without_a_link_shows_only_the_title(self) -> None:
         pr = pull_request(1603, "feat/guard")
@@ -100,3 +100,42 @@ class TestIssuePrefixInTable:
 
         assert "PR 1603" in output
         assert "#1577" not in output
+
+    def test_the_pull_request_number_is_separated_from_the_issue_number(self) -> None:
+        pr = pull_request(1611, "feat/guard", body="Closes #1607")
+        group = ProjectRuns(project(), runs=[], prs=[pr])
+
+        output = render(build_prs_table(group))
+
+        assert "PR #1611" in output
+        assert "#1607: PR 1611" in output
+
+
+class TestTitleWrapping:
+    def test_a_long_title_wraps_instead_of_being_truncated(self) -> None:
+        title = (
+            "auth: guard every ops-portal route, pin the roles prefix, "
+            "and stop the session cookie leaking across subdomains"
+        )
+        pr = pull_request(1611, "feat/guard", title=title, body="Closes #1607")
+        group = ProjectRuns(project(), runs=[], prs=[pr])
+
+        output = render(build_prs_table(group))
+
+        assert "…" not in output
+        assert len(output.splitlines()) > 1
+        for word in title.split():
+            assert word in output
+
+    def test_no_rendered_line_is_wider_than_the_console(self) -> None:
+        title = (
+            "auth: guard every ops-portal route, pin the roles prefix, "
+            "and stop the session cookie leaking across subdomains"
+        )
+        pr = pull_request(1611, "feat/guard", title=title, body="Closes #1607")
+        group = ProjectRuns(project(), runs=[], prs=[pr])
+
+        output = render(build_prs_table(group), width=100)
+
+        for line in output.splitlines():
+            assert len(line) <= 100

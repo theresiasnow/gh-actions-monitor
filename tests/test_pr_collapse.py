@@ -148,8 +148,8 @@ class TestSelectableRows:
         assert [row.pr["number"] for row in rows] == [11, 22]
 
 
-class TestTitleTruncation:
-    def test_long_pull_request_title_stays_on_one_line(self) -> None:
+class TestTitleWrapping:
+    def test_long_pull_request_title_wraps_onto_further_lines(self) -> None:
         long_title = (
             "docs: stop syncing a merely-behind branch, and correct "
             "the strict:false claim which is very long indeed"
@@ -160,8 +160,22 @@ class TestTitleTruncation:
 
         body = [line for line in render(build_prs_table(group), width=90).splitlines() if line.strip()]
 
-        assert len(body) == 1
-        assert "…" in body[0]
+        assert len(body) > 1
+        assert "…" not in "".join(body)
+        for word in long_title.split():
+            assert word in "".join(body)
+
+    def test_wrapping_does_not_widen_the_table(self) -> None:
+        long_title = (
+            "docs: stop syncing a merely-behind branch, and correct "
+            "the strict:false claim which is very long indeed"
+        )
+        group = ProjectRuns(
+            project(), runs=[], prs=[pull_request(11, "feat/one", title=long_title)]
+        )
+
+        for line in render(build_prs_table(group), width=90).splitlines():
+            assert len(line) <= 90
 
 
 def render_ansi(table: object, width: int = 100) -> str:

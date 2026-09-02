@@ -943,7 +943,7 @@ def build_prs_table(
     table.add_column(width=2)  # cursor indicator
     table.add_column(width=2)  # disclosure marker
     table.add_column(width=2)  # status icon
-    table.add_column(width=8, style="cyan")
+    table.add_column(width=11, style="cyan")
     table.add_column(ratio=6)
     table.add_column(width=22)  # status, wide enough to keep a gap after it
     table.add_column(width=16)  # author
@@ -956,10 +956,10 @@ def build_prs_table(
         children = bool(runs or pr.get("statusCheckRollup"))
         icon, style, status = pr_status(pr, runs)
         author = pr.get("author") or {}
-        title = Text(overflow="ellipsis", no_wrap=True)
+        title = Text(overflow="fold")
         issue = linked_issue_number(pr)
         if issue is not None:
-            title.append(f"#{issue} ", style="green")
+            title.append(f"#{issue}: ", style="green")
         title.append(
             pr.get("title") or "Untitled pull request",
             style="dim" if pr.get("isDraft") else "bold",
@@ -977,7 +977,7 @@ def build_prs_table(
             cursor_cell,
             marker,
             Text(icon, style=style),
-            f"#{number if number is not None else '?'}",
+            f"PR #{number if number is not None else '?'}",
             title,
             Text(status, style=style, overflow="ellipsis", no_wrap=True),
             Text(author.get("login") or "unknown", style="dim"),
