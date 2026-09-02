@@ -668,14 +668,15 @@ def pr_progress_counts(pr: dict, runs: list[dict] | None = None) -> Counter:
 
 
 def check_progress(checks: Counter) -> tuple[int, int, int, int]:
-    total = sum(checks.values())
+    # A cancelled run was superseded by a newer push, not broken by the change,
+    # so it is dropped from the total rather than counted for or against the PR.
+    total = sum(checks.values()) - checks["cancelled"]
     failing = (
         checks["failure"]
         + checks["failed"]
         + checks["error"]
         + checks["timed_out"]
         + checks["action_required"]
-        + checks["cancelled"]
     )
     passing = checks["success"] + checks["neutral"] + checks["skipped"]
     completed = min(total, passing + failing)
