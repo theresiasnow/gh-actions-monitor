@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import select
 import sys
 import subprocess
@@ -506,6 +507,7 @@ def fetch_prs(project: Project, limit: int) -> tuple[list[dict], str | None]:
             [
                 "number",
                 "title",
+                "body",
                 "headRefName",
                 "isDraft",
                 "mergeStateStatus",
@@ -582,6 +584,31 @@ def run_style(run: dict) -> tuple[str, str]:
     if status == "completed" and conclusion in CONCLUSION_STYLE:
         return CONCLUSION_STYLE[conclusion]
     return STATUS_STYLE.get(status, ("?", "dim"))
+
+
+CLOSING_KEYWORDS = (
+    "close",
+    "closes",
+    "closed",
+    "fix",
+    "fixes",
+    "fixed",
+    "resolve",
+    "resolves",
+    "resolved",
+)
+
+LINKED_ISSUE_PATTERN = re.compile(
+    rf"\b(?:{'|'.join(CLOSING_KEYWORDS)})\b\s*:?\s+"
+    r"(?:#|https?://github\.com/[^/\s]+/[^/\s]+/issues/)(\d+)",
+    re.IGNORECASE,
+)
+
+
+def linked_issue_number(pr: dict) -> int | None:
+    """Return the issue a pull request closes, from a GitHub closing keyword."""
+    match = LINKED_ISSUE_PATTERN.search(pr.get("body") or "")
+    return int(match.group(1)) if match else None
 
 
 def pr_check_counts(pr: dict) -> Counter:
@@ -917,9 +944,9 @@ def build_prs_table(
     table.add_column(width=2)  # disclosure marker
     table.add_column(width=2)  # status icon
     table.add_column(width=8, style="cyan")
-    table.add_column(ratio=4)
-    table.add_column(ratio=2)
-    table.add_column(ratio=2)
+    table.add_column(ratio=6)
+    table.add_column(width=22)  # status, wide enough to keep a gap after it
+    table.add_column(width=16)  # author
     table.add_column(width=12, justify="right")
 
     for pr in prs:
@@ -929,12 +956,14 @@ def build_prs_table(
         children = bool(runs or pr.get("statusCheckRollup"))
         icon, style, status = pr_status(pr, runs)
         author = pr.get("author") or {}
-        title = Text(
+        title = Text(overflow="ellipsis", no_wrap=True)
+        issue = linked_issue_number(pr)
+        if issue is not None:
+            title.append(f"#{issue} ", style="green")
+        title.append(
             pr.get("title") or "Untitled pull request",
-            overflow="ellipsis",
-            no_wrap=True,
+            style="dim" if pr.get("isDraft") else "bold",
         )
-        title.stylize("dim" if pr.get("isDraft") else "bold")
         updated = Text(time_ago(pr["updatedAt"]), style="dim")
 
         is_selected = selected_pr is not None and number == selected_pr
