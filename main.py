@@ -167,6 +167,8 @@ class KeyWatcher:
             return "quit"
         if ch in ("\r", "\n"):
             return "enter"
+        if ch == "\t":
+            return "tab"
         if ch == " ":
             return "toggle"
         if ch == "\x1b":
@@ -179,10 +181,8 @@ class KeyWatcher:
                             return "up"
                         if ch3 == "B":
                             return "down"
-                        if ch3 == "C":
-                            return "agents_down"
-                        if ch3 == "D":
-                            return "agents_up"
+                        if ch3 == "Z":
+                            return "back_tab"
                         if ch3 in ("5", "6"):
                             if self._ready(0.05) and self._read_char() == "~":
                                 return "page_up" if ch3 == "5" else "page_down"
@@ -1143,11 +1143,16 @@ def scroll_to(offset: int, index: int, page_size: int) -> int:
     return offset
 
 
+def scroll_hint(focused: bool) -> str:
+    return "↑/↓ scroll" if focused else "Tab to scroll"
+
+
 def build_issues_table(
     group: ProjectRuns,
     offset: int = 0,
     show_assignee: bool = True,
     page_size: int = ISSUE_PAGE_SIZE,
+    focused: bool = False,
 ) -> Table | Text:
     if group.issue_error:
         return Text(f"Issues: {group.issue_error}", style="red")
@@ -1194,7 +1199,7 @@ def build_issues_table(
             "",
             "",
             Text(
-                f"{offset + 1}–{last} of {len(issues)}  PgUp/PgDn scroll",
+                f"{offset + 1}–{last} of {len(issues)}  {scroll_hint(focused)}",
                 style="dim",
             ),
             *([""] * (3 if show_assignee else 2)),
@@ -1204,7 +1209,10 @@ def build_issues_table(
 
 
 def build_agents_table(
-    group: ProjectRuns, page_size: int = AGENT_PAGE_SIZE, offset: int = 0
+    group: ProjectRuns,
+    page_size: int = AGENT_PAGE_SIZE,
+    offset: int = 0,
+    focused: bool = False,
 ) -> Table | Text:
     all_rows = build_agent_rows(group)
     offset = clamp_offset(offset, len(all_rows), page_size)
@@ -1240,7 +1248,7 @@ def build_agents_table(
         last = offset + len(rows)
         table.add_row(
             "",
-            Text(f"… {offset + 1}–{last} of {len(all_rows)}  ←/→ scroll", style="dim"),
+            Text(f"… {offset + 1}–{last} of {len(all_rows)}  {scroll_hint(focused)}", style="dim"),
             "",
             "",
             "",
@@ -1248,6 +1256,12 @@ def build_agents_table(
         )
 
     return table
+
+
+def section_title(name: str, focused: bool) -> Text:
+    if focused:
+        return Text(f"▶ {name}", style="bold bright_cyan")
+    return Text(name, style="bold bright_white")
 
 
 def build_project_panel(
@@ -1262,6 +1276,7 @@ def build_project_panel(
     pr_page_size: int = PR_PAGE_SIZE,
     agent_page_size: int = AGENT_PAGE_SIZE,
     agent_offset: int = 0,
+    focus_kind: str | None = None,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
@@ -1273,10 +1288,16 @@ def build_project_panel(
         )
         or Text("No open pull requests.", style="dim")
     )
-    sections.append(Text("Issues", style="bold bright_white"))
-    sections.append(build_issues_table(group, issue_offset, show_assignee, issue_page_size))
-    sections.append(Text("Agents", style="bold bright_white"))
-    sections.append(build_agents_table(group, agent_page_size, agent_offset))
+    sections.append(section_title("Issues", focus_kind == "issues"))
+    sections.append(
+        build_issues_table(
+            group, issue_offset, show_assignee, issue_page_size, focus_kind == "issues"
+        )
+    )
+    sections.append(section_title("Agents", focus_kind == "agents"))
+    sections.append(
+        build_agents_table(group, agent_page_size, agent_offset, focus_kind == "agents")
+    )
     body = Group(*sections)
 
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
@@ -1302,6 +1323,7 @@ def build_dashboard(
     pr_page_size: int = PR_PAGE_SIZE,
     agent_page_size: int = AGENT_PAGE_SIZE,
     agent_offsets: dict[str, int] | None = None,
+    focus: tuple[str, str] | None = None,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1310,8 +1332,7 @@ def build_dashboard(
     header.append("  ↑/↓ navigate", style="dim")
     header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
-    header.append("  PgUp/PgDn issues", style="dim")
-    header.append("  ←/→ agents", style="dim")
+    header.append("  Tab pane", style="dim")
     header.append("  q quit", style="dim")
 
     panels = [
@@ -1329,6 +1350,7 @@ def build_dashboard(
                 pr_page_size,
                 agent_page_size,
                 (agent_offsets or {}).get(group.project.name, 0),
+                focus[0] if focus and focus[1] == group.project.name else None,
             )
             for group in project_runs
         ],
@@ -1495,6 +1517,20 @@ def fit_page_sizes(
     return tuple(sizes)  # type: ignore[return-value]
 
 
+def scroll_panes(
+    groups: list[ProjectRuns], issue_page: int, agent_page: int
+) -> list[tuple[str, str]]:
+    """Issue and agent lists too long to show in full, in Tab order."""
+    panes: list[tuple[str, str]] = []
+    for group in groups:
+        name = group.project.name
+        if len(group.issues or []) > issue_page:
+            panes.append(("issues", name))
+        if len(build_agent_rows(group)) > agent_page:
+            panes.append(("agents", name))
+    return panes
+
+
 def pr_offsets_following(
     groups: list[ProjectRuns],
     offsets: dict[str, int],
@@ -1528,6 +1564,7 @@ def run_monitor(
     pr_offsets: dict[str, int] = {}
     agent_offsets: dict[str, int] = {}
     agent_page = AGENT_PAGE_SIZE
+    focus: tuple[str, str] | None = None  # None: the run and PR cursor list
     expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
 
@@ -1538,7 +1575,7 @@ def run_monitor(
                 now = datetime.now().strftime("%H:%M:%S")
 
                 def render() -> None:
-                    nonlocal issue_page, agent_page
+                    nonlocal issue_page, agent_page, focus
                     rows = selectable_rows(groups, expanded_prs)
                     selected = rows[cursor] if rows else None
 
@@ -1561,12 +1598,15 @@ def run_monitor(
                             pr_page,
                             agent_page,
                             agent_offsets,
+                            focus,
                         )
 
                     pr_page, issue_page, agent_page = fit_page_sizes(console, build)
                     pr_offsets.update(
                         pr_offsets_following(groups, pr_offsets, selected, pr_page)
                     )
+                    if focus not in scroll_panes(groups, issue_page, agent_page):
+                        focus = None
                     live.update(build(pr_page, issue_page, agent_page))
 
                 rows = selectable_rows(groups, expanded_prs)
@@ -1580,38 +1620,34 @@ def run_monitor(
                     rows = selectable_rows(groups, expanded_prs)
                     if key == "quit":
                         return
-                    if key == "up" and rows:
+                    if key in ("tab", "back_tab"):
+                        panes: list[tuple[str, str] | None] = [
+                            None,
+                            *scroll_panes(groups, issue_page, agent_page),
+                        ]
+                        index = panes.index(focus) if focus in panes else 0
+                        step = 1 if key == "tab" else -1
+                        focus = panes[(index + step) % len(panes)]
+                        render()
+                    elif focus and key in ("up", "down", "page_up", "page_down"):
+                        kind, name = focus
+                        group = next((g for g in groups if g.project.name == name), None)
+                        if group:
+                            issues = kind == "issues"
+                            page = issue_page if issues else agent_page
+                            offsets = issue_offsets if issues else agent_offsets
+                            total = len(group.issues or []) if issues else len(build_agent_rows(group))
+                            step = page if key.startswith("page") else 1
+                            if key in ("up", "page_up"):
+                                step = -step
+                            offsets[name] = clamp_offset(offsets.get(name, 0) + step, total, page)
+                            render()
+                    elif key == "up" and rows:
                         cursor = max(0, cursor - 1)
                         render()
                     elif key == "down" and rows:
                         cursor = min(len(rows) - 1, cursor + 1)
                         render()
-                    elif key in ("page_up", "page_down") and rows:
-                        group = next(
-                            (g for g in groups if g.project == rows[cursor].project), None
-                        )
-                        if group:
-                            name = group.project.name
-                            step = issue_page if key == "page_down" else -issue_page
-                            issue_offsets[name] = clamp_offset(
-                                issue_offsets.get(name, 0) + step,
-                                len(group.issues or []),
-                                issue_page,
-                            )
-                            render()
-                    elif key in ("agents_up", "agents_down") and rows:
-                        group = next(
-                            (g for g in groups if g.project == rows[cursor].project), None
-                        )
-                        if group:
-                            name = group.project.name
-                            step = agent_page if key == "agents_down" else -agent_page
-                            agent_offsets[name] = clamp_offset(
-                                agent_offsets.get(name, 0) + step,
-                                len(build_agent_rows(group)),
-                                agent_page,
-                            )
-                            render()
                     elif key == "toggle" and rows:
                         selected = rows[cursor]
                         number = selected.pr.get("number") if selected.pr else None
