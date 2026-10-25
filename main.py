@@ -37,6 +37,8 @@ DEFAULT_REPO_LIMIT = 100
 DEFAULT_ISSUE_LIMIT = 100
 ISSUE_PAGE_SIZE = 8  # most issue rows per project; fewer when the terminal is short
 ISSUE_MIN_PAGE_SIZE = 3  # kept even when the dashboard then overflows the terminal
+PR_PAGE_SIZE = 10  # most pull request rows per project
+PR_MIN_PAGE_SIZE = 3
 # Below this width the assignee column is dropped to leave room for titles.
 ISSUE_ASSIGNEE_MIN_WIDTH = 110
 SETTINGS_FILE_NAME = "settings.toml"
@@ -1005,6 +1007,8 @@ def build_prs_table(
     expanded_prs: set[int] | None = None,
     selected_pr: int | None = None,
     selected_id: int | None = None,
+    pr_offset: int = 0,
+    page_size: int = PR_PAGE_SIZE,
 ) -> Table | Text | None:
     if group.pr_error:
         return Text(f"PRs: {group.pr_error}", style="red")
@@ -1025,7 +1029,8 @@ def build_prs_table(
     table.add_column(width=16)  # author
     table.add_column(width=12, justify="right")
 
-    for pr in prs:
+    pr_offset = clamp_offset(pr_offset, len(prs), page_size)
+    for pr in prs[pr_offset : pr_offset + page_size]:
         runs = related_pr_runs(pr, group.runs)
         number = pr.get("number")
         is_expanded = number in expanded
@@ -1103,11 +1108,33 @@ def build_prs_table(
                 "",
             )
 
+    if len(prs) > page_size:
+        last = min(pr_offset + page_size, len(prs))
+        table.add_row(
+            "",
+            "",
+            "",
+            "",
+            Text(f"{pr_offset + 1}–{last} of {len(prs)}  ↑/↓ scroll", style="dim"),
+            "",
+            "",
+            "",
+        )
+
     return table
 
 
-def clamp_issue_offset(offset: int, total: int, page_size: int = ISSUE_PAGE_SIZE) -> int:
+def clamp_offset(offset: int, total: int, page_size: int) -> int:
     return max(0, min(offset, max(0, total - page_size)))
+
+
+def scroll_to(offset: int, index: int, page_size: int) -> int:
+    """Smallest move of a window that brings ``index`` into view."""
+    if index < offset:
+        return index
+    if index >= offset + page_size:
+        return index - page_size + 1
+    return offset
 
 
 def build_issues_table(
@@ -1132,7 +1159,7 @@ def build_issues_table(
         table.add_column(width=16)
     table.add_column(width=12, justify="right")
 
-    offset = clamp_issue_offset(offset, len(issues), page_size)
+    offset = clamp_offset(offset, len(issues), page_size)
     for issue in issues[offset : offset + page_size]:
         labels = ", ".join(label.get("name", "") for label in issue.get("labels") or [])
         assignees = ", ".join(a.get("login", "") for a in issue.get("assignees") or [])
@@ -1210,13 +1237,17 @@ def build_project_panel(
     issue_offset: int = 0,
     show_assignee: bool = True,
     issue_page_size: int = ISSUE_PAGE_SIZE,
+    pr_offset: int = 0,
+    pr_page_size: int = PR_PAGE_SIZE,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
     sections.append(build_runs_table(group, selected_id))
     sections.append(Text("Pull Requests", style="bold bright_white"))
     sections.append(
-        build_prs_table(group, expanded_prs, selected_pr, selected_id)
+        build_prs_table(
+            group, expanded_prs, selected_pr, selected_id, pr_offset, pr_page_size
+        )
         or Text("No open pull requests.", style="dim")
     )
     sections.append(Text("Issues", style="bold bright_white"))
@@ -1244,6 +1275,8 @@ def build_dashboard(
     issue_offsets: dict[str, int] | None = None,
     width: int = ISSUE_ASSIGNEE_MIN_WIDTH,
     issue_page_size: int = ISSUE_PAGE_SIZE,
+    pr_offsets: dict[str, int] | None = None,
+    pr_page_size: int = PR_PAGE_SIZE,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1266,6 +1299,8 @@ def build_dashboard(
                 (issue_offsets or {}).get(group.project.name, 0),
                 width >= ISSUE_ASSIGNEE_MIN_WIDTH,
                 issue_page_size,
+                (pr_offsets or {}).get(group.project.name, 0),
+                pr_page_size,
             )
             for group in project_runs
         ],
@@ -1402,15 +1437,51 @@ def main(
     run_monitor(console, projects, limit, pr_limit, issue_limit, refresh)
 
 
-def fit_issue_page_size(console: Console, build: Callable[[int], Group], groups: int) -> int:
-    """Issue rows per project that keep the whole dashboard inside the terminal.
+def fit_page_sizes(
+    console: Console, build: Callable[[int, int], Group]
+) -> tuple[int, int]:
+    """Pull request and issue rows per project that keep the dashboard on screen.
 
-    Measures the dashboard with one issue row per project, then shares the
-    spare height between the projects, from ISSUE_MIN_PAGE_SIZE up to ISSUE_PAGE_SIZE rows each.
+    Starts both lists at their minimum, which is kept even when that already
+    overflows, then grows them in turn while the dashboard still fits.
     """
-    used = len(console.render_lines(build(1), pad=False))
-    spare = console.height - used
-    return max(ISSUE_MIN_PAGE_SIZE, min(ISSUE_PAGE_SIZE, 1 + spare // max(1, groups)))
+
+    def fits(pr_page: int, issue_page: int) -> bool:
+        return len(console.render_lines(build(pr_page, issue_page), pad=False)) <= console.height
+
+    pr_page, issue_page = PR_MIN_PAGE_SIZE, ISSUE_MIN_PAGE_SIZE
+    if not fits(pr_page, issue_page):
+        return pr_page, issue_page
+
+    grew = True
+    while grew:
+        grew = False
+        if pr_page < PR_PAGE_SIZE and fits(pr_page + 1, issue_page):
+            pr_page += 1
+            grew = True
+        if issue_page < ISSUE_PAGE_SIZE and fits(pr_page, issue_page + 1):
+            issue_page += 1
+            grew = True
+    return pr_page, issue_page
+
+
+def pr_offsets_following(
+    groups: list[ProjectRuns],
+    offsets: dict[str, int],
+    selected: SelectableRow | None,
+    page_size: int,
+) -> dict[str, int]:
+    """Offsets with the selected project's PR window moved to show the cursor."""
+    if not selected or not selected.pr:
+        return offsets
+    name = selected.project.name
+    group = next((g for g in groups if g.project.name == name), None)
+    number = selected.pr.get("number")
+    numbers = [pr.get("number") for pr in (group.prs if group else None) or []]
+    if number not in numbers:
+        return offsets
+    index = numbers.index(number)
+    return {**offsets, name: scroll_to(offsets.get(name, 0), index, page_size)}
 
 
 def run_monitor(
@@ -1424,6 +1495,7 @@ def run_monitor(
     cursor = 0
     issue_offsets: dict[str, int] = {}
     issue_page = ISSUE_PAGE_SIZE
+    pr_offsets: dict[str, int] = {}
     expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
 
@@ -1438,7 +1510,7 @@ def run_monitor(
                     rows = selectable_rows(groups, expanded_prs)
                     selected = rows[cursor] if rows else None
 
-                    def build(page_size: int) -> Group:
+                    def build(pr_page: int, page_size: int) -> Group:
                         return build_dashboard(
                             groups,
                             now,
@@ -1453,10 +1525,15 @@ def run_monitor(
                             issue_offsets,
                             console.width,
                             page_size,
+                            pr_offsets_following(groups, pr_offsets, selected, pr_page),
+                            pr_page,
                         )
 
-                    issue_page = fit_issue_page_size(console, build, len(groups))
-                    live.update(build(issue_page))
+                    pr_page, issue_page = fit_page_sizes(console, build)
+                    pr_offsets.update(
+                        pr_offsets_following(groups, pr_offsets, selected, pr_page)
+                    )
+                    live.update(build(pr_page, issue_page))
 
                 rows = selectable_rows(groups, expanded_prs)
                 if rows:
@@ -1482,7 +1559,7 @@ def run_monitor(
                         if group:
                             name = group.project.name
                             step = issue_page if key == "page_down" else -issue_page
-                            issue_offsets[name] = clamp_issue_offset(
+                            issue_offsets[name] = clamp_offset(
                                 issue_offsets.get(name, 0) + step,
                                 len(group.issues or []),
                                 issue_page,
