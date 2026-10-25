@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 import select
 import sys
@@ -32,6 +33,8 @@ REFRESH_SECONDS = 15
 DEFAULT_LIMIT = 12
 DEFAULT_SCAN_DEPTH = 2
 DEFAULT_REPO_LIMIT = 100
+DEFAULT_ISSUE_LIMIT = 100
+ISSUE_PAGE_SIZE = 8
 SETTINGS_FILE_NAME = "settings.toml"
 
 # Highlight the selected row with a background colour rather than `reverse`:
@@ -132,16 +135,26 @@ class KeyWatcher:
         if self._fd is not None:
             tty.setcbreak(self._fd)
 
+    def _ready(self, timeout: float) -> bool:
+        # Poll and read the fd directly: sys.stdin buffers a whole escape
+        # sequence on the first read, so select() on it would report nothing
+        # waiting while the rest of the sequence sits in the buffer.
+        readable, _, _ = select.select([self._fd], [], [], timeout)
+        return bool(readable)
+
+    def _read_char(self) -> str:
+        assert self._fd is not None
+        return os.read(self._fd, 1).decode(errors="ignore")
+
     def read_key(self) -> str | None:
         """Return the next key action or None if no key is waiting."""
         if self._fd is None:
             return None
 
-        readable, _, _ = select.select([sys.stdin], [], [], 0)
-        if not readable:
+        if not self._ready(0):
             return None
 
-        ch = sys.stdin.read(1)
+        ch = self._read_char()
         if ch in ("q", "Q"):
             return "quit"
         if ch in ("\r", "\n"):
@@ -149,17 +162,18 @@ class KeyWatcher:
         if ch == " ":
             return "toggle"
         if ch == "\x1b":
-            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if readable:
-                ch2 = sys.stdin.read(1)
+            if self._ready(0.05):
+                ch2 = self._read_char()
                 if ch2 == "[":
-                    readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if readable:
-                        ch3 = sys.stdin.read(1)
+                    if self._ready(0.05):
+                        ch3 = self._read_char()
                         if ch3 == "A":
                             return "up"
                         if ch3 == "B":
                             return "down"
+                        if ch3 in ("5", "6"):
+                            if self._ready(0.05) and self._read_char() == "~":
+                                return "page_up" if ch3 == "5" else "page_down"
         return None
 
 
@@ -576,10 +590,12 @@ def fetch_issues(project: Project, limit: int) -> tuple[list[dict], str | None]:
     return issues, None
 
 
-def fetch_project_runs(project: Project, run_limit: int, pr_limit: int) -> ProjectRuns:
+def fetch_project_runs(
+    project: Project, run_limit: int, pr_limit: int, issue_limit: int
+) -> ProjectRuns:
     group = fetch_runs(project, run_limit)
     prs, pr_error = fetch_prs(project, pr_limit)
-    issues, issue_error = fetch_issues(project, pr_limit)
+    issues, issue_error = fetch_issues(project, issue_limit)
     worktrees = project_worktrees(project)
     default_branch = default_branch_name(project.path) if project.local else None
     return ProjectRuns(
@@ -1086,7 +1102,11 @@ def build_prs_table(
     return table
 
 
-def build_issues_table(group: ProjectRuns) -> Table | Text:
+def clamp_issue_offset(offset: int, total: int) -> int:
+    return max(0, min(offset, max(0, total - ISSUE_PAGE_SIZE)))
+
+
+def build_issues_table(group: ProjectRuns, offset: int = 0) -> Table | Text:
     if group.issue_error:
         return Text(f"Issues: {group.issue_error}", style="red")
 
@@ -1094,25 +1114,45 @@ def build_issues_table(group: ProjectRuns) -> Table | Text:
     if not issues:
         return Text("No open issues.", style="dim")
 
-    table = Table.grid(expand=True)
+    table = Table.grid(expand=True, padding=(0, 1, 0, 0))
     table.add_column(width=2)
     table.add_column(width=11, style="cyan")
     table.add_column(ratio=6)
-    table.add_column(ratio=2)
+    table.add_column(width=18)  # labels
     table.add_column(width=16)  # assignee
     table.add_column(width=12, justify="right")
 
-    for issue in issues:
+    offset = clamp_issue_offset(offset, len(issues))
+    for issue in issues[offset : offset + ISSUE_PAGE_SIZE]:
         labels = ", ".join(label.get("name", "") for label in issue.get("labels") or [])
         assignees = ", ".join(a.get("login", "") for a in issue.get("assignees") or [])
         number = issue.get("number")
         table.add_row(
             Text("●", style="green"),
             f"#{number if number is not None else '?'}",
-            Text(issue.get("title") or "Untitled issue", style="bold", overflow="fold"),
+            Text(
+                issue.get("title") or "Untitled issue",
+                style="bold",
+                overflow="ellipsis",
+                no_wrap=True,
+            ),
             Text(labels, style="magenta", overflow="ellipsis", no_wrap=True),
             Text(assignees or "unassigned", style="dim", overflow="ellipsis", no_wrap=True),
             Text(time_ago(issue["updatedAt"]), style="dim"),
+        )
+
+    if len(issues) > ISSUE_PAGE_SIZE:
+        last = min(offset + ISSUE_PAGE_SIZE, len(issues))
+        table.add_row(
+            "",
+            "",
+            Text(
+                f"{offset + 1}–{last} of {len(issues)}  PgUp/PgDn scroll",
+                style="dim",
+            ),
+            "",
+            "",
+            "",
         )
 
     return table
@@ -1155,6 +1195,7 @@ def build_project_panel(
     selected_id: int | None = None,
     expanded_prs: set[int] | None = None,
     selected_pr: int | None = None,
+    issue_offset: int = 0,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
@@ -1165,7 +1206,7 @@ def build_project_panel(
         or Text("No open pull requests.", style="dim")
     )
     sections.append(Text("Issues", style="bold bright_white"))
-    sections.append(build_issues_table(group))
+    sections.append(build_issues_table(group, issue_offset))
     sections.append(Text("Agents", style="bold bright_white"))
     sections.append(build_agents_table(group))
     body = Group(*sections)
@@ -1186,6 +1227,7 @@ def build_dashboard(
     selected_id: int | None = None,
     expanded_prs: set[int] | None = None,
     selected_pr: int | None = None,
+    issue_offsets: dict[str, int] | None = None,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1194,12 +1236,19 @@ def build_dashboard(
     header.append("  ↑/↓ navigate", style="dim")
     header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
+    header.append("  PgUp/PgDn issues", style="dim")
     header.append("  q quit", style="dim")
 
     panels = [
         build_summary(project_runs),
         *[
-            build_project_panel(group, selected_id, expanded_prs, selected_pr)
+            build_project_panel(
+                group,
+                selected_id,
+                expanded_prs,
+                selected_pr,
+                (issue_offsets or {}).get(group.project.name, 0),
+            )
             for group in project_runs
         ],
     ]
@@ -1275,6 +1324,14 @@ def main(
             help=f"Open pull requests to fetch per project. Default: {DEFAULT_LIMIT}.",
         ),
     ] = DEFAULT_LIMIT,
+    issue_limit: Annotated[
+        int,
+        typer.Option(
+            "--issue-limit",
+            min=1,
+            help=f"Open issues to fetch per project. Default: {DEFAULT_ISSUE_LIMIT}.",
+        ),
+    ] = DEFAULT_ISSUE_LIMIT,
     refresh: Annotated[
         int,
         typer.Option(
@@ -1301,7 +1358,7 @@ def main(
             console.print("[red]No projects found.[/]")
             return
 
-        run_monitor(console, projects, limit, pr_limit, refresh)
+        run_monitor(console, projects, limit, pr_limit, issue_limit, refresh)
         return
 
     if select:
@@ -1324,20 +1381,26 @@ def main(
         console.print("[red]No projects found.[/]")
         return
 
-    run_monitor(console, projects, limit, pr_limit, refresh)
+    run_monitor(console, projects, limit, pr_limit, issue_limit, refresh)
 
 
 def run_monitor(
-    console: Console, projects: list[Project], limit: int, pr_limit: int, refresh: int
+    console: Console,
+    projects: list[Project],
+    limit: int,
+    pr_limit: int,
+    issue_limit: int,
+    refresh: int,
 ) -> None:
     cursor = 0
+    issue_offsets: dict[str, int] = {}
     expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
 
     with KeyWatcher() as keys:
         with Live(console=console, refresh_per_second=2, screen=True) as live:
             while True:
-                groups = [fetch_project_runs(project, limit, pr_limit) for project in projects]
+                groups = [fetch_project_runs(project, limit, pr_limit, issue_limit) for project in projects]
                 now = datetime.now().strftime("%H:%M:%S")
 
                 def render() -> None:
@@ -1355,6 +1418,7 @@ def run_monitor(
                             selected.pr.get("number")
                             if selected and selected.kind == "pr" and selected.pr
                             else None,
+                            issue_offsets,
                         )
                     )
 
@@ -1375,6 +1439,17 @@ def run_monitor(
                     elif key == "down" and rows:
                         cursor = min(len(rows) - 1, cursor + 1)
                         render()
+                    elif key in ("page_up", "page_down") and rows:
+                        group = next(
+                            (g for g in groups if g.project == rows[cursor].project), None
+                        )
+                        if group:
+                            name = group.project.name
+                            step = ISSUE_PAGE_SIZE if key == "page_down" else -ISSUE_PAGE_SIZE
+                            issue_offsets[name] = clamp_issue_offset(
+                                issue_offsets.get(name, 0) + step, len(group.issues or [])
+                            )
+                            render()
                     elif key == "toggle" and rows:
                         selected = rows[cursor]
                         number = selected.pr.get("number") if selected.pr else None
