@@ -81,6 +81,8 @@ class ProjectRuns:
     pr_error: str | None = None
     worktrees: list[dict] | None = None
     default_branch: str | None = None
+    issues: list[dict] | None = None
+    issue_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -542,13 +544,54 @@ def fetch_prs(project: Project, limit: int) -> tuple[list[dict], str | None]:
     return prs, None
 
 
+def fetch_issues(project: Project, limit: int) -> tuple[list[dict], str | None]:
+    args = [
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,title,labels,assignees,updatedAt,url",
+    ]
+    if project.repo:
+        args.extend(["--repo", project.repo])
+
+    try:
+        result = run_gh(args, cwd=project.path)
+    except FileNotFoundError as exc:
+        missing = exc.filename or "gh"
+        return [], f"Could not run {missing}. Is GitHub CLI installed?"
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or "GitHub CLI did not return issues."
+        return [], message
+
+    try:
+        issues = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return [], f"Could not parse GitHub issue output: {exc}"
+
+    return issues, None
+
+
 def fetch_project_runs(project: Project, run_limit: int, pr_limit: int) -> ProjectRuns:
     group = fetch_runs(project, run_limit)
     prs, pr_error = fetch_prs(project, pr_limit)
+    issues, issue_error = fetch_issues(project, pr_limit)
     worktrees = project_worktrees(project)
     default_branch = default_branch_name(project.path) if project.local else None
     return ProjectRuns(
-        group.project, group.runs, group.error, prs, pr_error, worktrees, default_branch
+        group.project,
+        group.runs,
+        group.error,
+        prs,
+        pr_error,
+        worktrees,
+        default_branch,
+        issues,
+        issue_error,
     )
 
 
@@ -866,6 +909,8 @@ def project_title(group: ProjectRuns) -> Text:
         title.append(f"  {active} active", style="yellow")
     if group.prs:
         title.append(f"  {len(group.prs)} PRs", style="bright_blue")
+    if group.issues:
+        title.append(f"  {len(group.issues)} issues", style="green")
     if failures:
         title.append(f"  {failures} failing", style="red")
     return title
@@ -1041,6 +1086,38 @@ def build_prs_table(
     return table
 
 
+def build_issues_table(group: ProjectRuns) -> Table | Text:
+    if group.issue_error:
+        return Text(f"Issues: {group.issue_error}", style="red")
+
+    issues = group.issues or []
+    if not issues:
+        return Text("No open issues.", style="dim")
+
+    table = Table.grid(expand=True)
+    table.add_column(width=2)
+    table.add_column(width=11, style="cyan")
+    table.add_column(ratio=6)
+    table.add_column(ratio=2)
+    table.add_column(width=16)  # assignee
+    table.add_column(width=12, justify="right")
+
+    for issue in issues:
+        labels = ", ".join(label.get("name", "") for label in issue.get("labels") or [])
+        assignees = ", ".join(a.get("login", "") for a in issue.get("assignees") or [])
+        number = issue.get("number")
+        table.add_row(
+            Text("●", style="green"),
+            f"#{number if number is not None else '?'}",
+            Text(issue.get("title") or "Untitled issue", style="bold", overflow="fold"),
+            Text(labels, style="magenta", overflow="ellipsis", no_wrap=True),
+            Text(assignees or "unassigned", style="dim", overflow="ellipsis", no_wrap=True),
+            Text(time_ago(issue["updatedAt"]), style="dim"),
+        )
+
+    return table
+
+
 def build_agents_table(group: ProjectRuns) -> Table | Text:
     rows = build_agent_rows(group)
     if not rows:
@@ -1087,6 +1164,8 @@ def build_project_panel(
         build_prs_table(group, expanded_prs, selected_pr, selected_id)
         or Text("No open pull requests.", style="dim")
     )
+    sections.append(Text("Issues", style="bold bright_white"))
+    sections.append(build_issues_table(group))
     sections.append(Text("Agents", style="bold bright_white"))
     sections.append(build_agents_table(group))
     body = Group(*sections)
@@ -1094,7 +1173,7 @@ def build_project_panel(
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
     if any(run.get("conclusion") in {"failure", "timed_out"} for run in group.runs):
         border_style = "red"
-    if group.error or group.pr_error:
+    if group.error or group.pr_error or group.issue_error:
         border_style = "red"
 
     return Panel(body, title=project_title(group), border_style=border_style, expand=True)
