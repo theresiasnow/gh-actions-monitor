@@ -169,6 +169,10 @@ class KeyWatcher:
             return "enter"
         if ch == " ":
             return "toggle"
+        if ch == "[":
+            return "agents_up"
+        if ch == "]":
+            return "agents_down"
         if ch == "\x1b":
             if self._ready(0.05):
                 ch2 = self._read_char()
@@ -1199,9 +1203,12 @@ def build_issues_table(
     return table
 
 
-def build_agents_table(group: ProjectRuns, page_size: int = AGENT_PAGE_SIZE) -> Table | Text:
+def build_agents_table(
+    group: ProjectRuns, page_size: int = AGENT_PAGE_SIZE, offset: int = 0
+) -> Table | Text:
     all_rows = build_agent_rows(group)
-    rows = all_rows[:page_size]
+    offset = clamp_offset(offset, len(all_rows), page_size)
+    rows = all_rows[offset : offset + page_size]
     if not rows:
         return Text("No worktrees or PR branches.", style="dim")
 
@@ -1229,8 +1236,16 @@ def build_agents_table(group: ProjectRuns, page_size: int = AGENT_PAGE_SIZE) -> 
         origin = Text("worktree" if row.is_worktree else "remote", style="dim")
         table.add_row(marker, name, Text(test_label, style=test_style), pr_cell, detail, origin)
 
-    if len(all_rows) > len(rows):
-        table.add_row("", Text(f"… {len(all_rows) - len(rows)} more", style="dim"), "", "", "", "")
+    if len(all_rows) > page_size:
+        last = offset + len(rows)
+        table.add_row(
+            "",
+            Text(f"… {offset + 1}–{last} of {len(all_rows)}  [ ] scroll", style="dim"),
+            "",
+            "",
+            "",
+            "",
+        )
 
     return table
 
@@ -1246,6 +1261,7 @@ def build_project_panel(
     pr_offset: int = 0,
     pr_page_size: int = PR_PAGE_SIZE,
     agent_page_size: int = AGENT_PAGE_SIZE,
+    agent_offset: int = 0,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
@@ -1260,7 +1276,7 @@ def build_project_panel(
     sections.append(Text("Issues", style="bold bright_white"))
     sections.append(build_issues_table(group, issue_offset, show_assignee, issue_page_size))
     sections.append(Text("Agents", style="bold bright_white"))
-    sections.append(build_agents_table(group, agent_page_size))
+    sections.append(build_agents_table(group, agent_page_size, agent_offset))
     body = Group(*sections)
 
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
@@ -1285,6 +1301,7 @@ def build_dashboard(
     pr_offsets: dict[str, int] | None = None,
     pr_page_size: int = PR_PAGE_SIZE,
     agent_page_size: int = AGENT_PAGE_SIZE,
+    agent_offsets: dict[str, int] | None = None,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1294,6 +1311,7 @@ def build_dashboard(
     header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
     header.append("  PgUp/PgDn issues", style="dim")
+    header.append("  [ ] agents", style="dim")
     header.append("  q quit", style="dim")
 
     panels = [
@@ -1310,6 +1328,7 @@ def build_dashboard(
                 (pr_offsets or {}).get(group.project.name, 0),
                 pr_page_size,
                 agent_page_size,
+                (agent_offsets or {}).get(group.project.name, 0),
             )
             for group in project_runs
         ],
@@ -1507,6 +1526,8 @@ def run_monitor(
     issue_offsets: dict[str, int] = {}
     issue_page = ISSUE_PAGE_SIZE
     pr_offsets: dict[str, int] = {}
+    agent_offsets: dict[str, int] = {}
+    agent_page = AGENT_PAGE_SIZE
     expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
 
@@ -1517,7 +1538,7 @@ def run_monitor(
                 now = datetime.now().strftime("%H:%M:%S")
 
                 def render() -> None:
-                    nonlocal issue_page
+                    nonlocal issue_page, agent_page
                     rows = selectable_rows(groups, expanded_prs)
                     selected = rows[cursor] if rows else None
 
@@ -1539,6 +1560,7 @@ def run_monitor(
                             pr_offsets_following(groups, pr_offsets, selected, pr_page),
                             pr_page,
                             agent_page,
+                            agent_offsets,
                         )
 
                     pr_page, issue_page, agent_page = fit_page_sizes(console, build)
@@ -1575,6 +1597,19 @@ def run_monitor(
                                 issue_offsets.get(name, 0) + step,
                                 len(group.issues or []),
                                 issue_page,
+                            )
+                            render()
+                    elif key in ("agents_up", "agents_down") and rows:
+                        group = next(
+                            (g for g in groups if g.project == rows[cursor].project), None
+                        )
+                        if group:
+                            name = group.project.name
+                            step = agent_page if key == "agents_down" else -agent_page
+                            agent_offsets[name] = clamp_offset(
+                                agent_offsets.get(name, 0) + step,
+                                len(build_agent_rows(group)),
+                                agent_page,
                             )
                             render()
                     elif key == "toggle" and rows:
