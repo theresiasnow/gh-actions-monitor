@@ -36,6 +36,7 @@ DEFAULT_SCAN_DEPTH = 2
 DEFAULT_REPO_LIMIT = 100
 DEFAULT_ISSUE_LIMIT = 100
 ISSUE_PAGE_SIZE = 8  # most issue rows per project; fewer when the terminal is short
+ISSUE_MIN_PAGE_SIZE = 3  # kept even when the dashboard then overflows the terminal
 # Below this width the assignee column is dropped to leave room for titles.
 ISSUE_ASSIGNEE_MIN_WIDTH = 110
 SETTINGS_FILE_NAME = "settings.toml"
@@ -1405,11 +1406,11 @@ def fit_issue_page_size(console: Console, build: Callable[[int], Group], groups:
     """Issue rows per project that keep the whole dashboard inside the terminal.
 
     Measures the dashboard with one issue row per project, then shares the
-    spare height between the projects, up to ISSUE_PAGE_SIZE rows each.
+    spare height between the projects, from ISSUE_MIN_PAGE_SIZE up to ISSUE_PAGE_SIZE rows each.
     """
     used = len(console.render_lines(build(1), pad=False))
     spare = console.height - used
-    return max(1, min(ISSUE_PAGE_SIZE, 1 + spare // max(1, groups)))
+    return max(ISSUE_MIN_PAGE_SIZE, min(ISSUE_PAGE_SIZE, 1 + spare // max(1, groups)))
 
 
 def run_monitor(
