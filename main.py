@@ -169,10 +169,6 @@ class KeyWatcher:
             return "enter"
         if ch == " ":
             return "toggle"
-        if ch == "[":
-            return "agents_up"
-        if ch == "]":
-            return "agents_down"
         if ch == "\x1b":
             if self._ready(0.05):
                 ch2 = self._read_char()
@@ -183,6 +179,10 @@ class KeyWatcher:
                             return "up"
                         if ch3 == "B":
                             return "down"
+                        if ch3 == "C":
+                            return "agents_down"
+                        if ch3 == "D":
+                            return "agents_up"
                         if ch3 in ("5", "6"):
                             if self._ready(0.05) and self._read_char() == "~":
                                 return "page_up" if ch3 == "5" else "page_down"
@@ -1240,7 +1240,7 @@ def build_agents_table(
         last = offset + len(rows)
         table.add_row(
             "",
-            Text(f"… {offset + 1}–{last} of {len(all_rows)}  [ ] scroll", style="dim"),
+            Text(f"… {offset + 1}–{last} of {len(all_rows)}  ←/→ scroll", style="dim"),
             "",
             "",
             "",
@@ -1311,7 +1311,7 @@ def build_dashboard(
     header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
     header.append("  PgUp/PgDn issues", style="dim")
-    header.append("  [ ] agents", style="dim")
+    header.append("  ←/→ agents", style="dim")
     header.append("  q quit", style="dim")
 
     panels = [
