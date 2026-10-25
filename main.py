@@ -35,6 +35,8 @@ DEFAULT_SCAN_DEPTH = 2
 DEFAULT_REPO_LIMIT = 100
 DEFAULT_ISSUE_LIMIT = 100
 ISSUE_PAGE_SIZE = 8
+# Below this width the assignee column is dropped to leave room for titles.
+ISSUE_ASSIGNEE_MIN_WIDTH = 110
 SETTINGS_FILE_NAME = "settings.toml"
 
 # Highlight the selected row with a background colour rather than `reverse`:
@@ -1106,7 +1108,9 @@ def clamp_issue_offset(offset: int, total: int) -> int:
     return max(0, min(offset, max(0, total - ISSUE_PAGE_SIZE)))
 
 
-def build_issues_table(group: ProjectRuns, offset: int = 0) -> Table | Text:
+def build_issues_table(
+    group: ProjectRuns, offset: int = 0, show_assignee: bool = True
+) -> Table | Text:
     if group.issue_error:
         return Text(f"Issues: {group.issue_error}", style="red")
 
@@ -1119,7 +1123,8 @@ def build_issues_table(group: ProjectRuns, offset: int = 0) -> Table | Text:
     table.add_column(width=11, style="cyan")
     table.add_column(ratio=6)
     table.add_column(width=18)  # labels
-    table.add_column(width=16)  # assignee
+    if show_assignee:
+        table.add_column(width=16)
     table.add_column(width=12, justify="right")
 
     offset = clamp_issue_offset(offset, len(issues))
@@ -1137,7 +1142,11 @@ def build_issues_table(group: ProjectRuns, offset: int = 0) -> Table | Text:
                 no_wrap=True,
             ),
             Text(labels, style="magenta", overflow="ellipsis", no_wrap=True),
-            Text(assignees or "unassigned", style="dim", overflow="ellipsis", no_wrap=True),
+            *(
+                [Text(assignees or "unassigned", style="dim", overflow="ellipsis", no_wrap=True)]
+                if show_assignee
+                else []
+            ),
             Text(time_ago(issue["updatedAt"]), style="dim"),
         )
 
@@ -1150,9 +1159,7 @@ def build_issues_table(group: ProjectRuns, offset: int = 0) -> Table | Text:
                 f"{offset + 1}–{last} of {len(issues)}  PgUp/PgDn scroll",
                 style="dim",
             ),
-            "",
-            "",
-            "",
+            *([""] * (3 if show_assignee else 2)),
         )
 
     return table
@@ -1196,6 +1203,7 @@ def build_project_panel(
     expanded_prs: set[int] | None = None,
     selected_pr: int | None = None,
     issue_offset: int = 0,
+    show_assignee: bool = True,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
@@ -1206,7 +1214,7 @@ def build_project_panel(
         or Text("No open pull requests.", style="dim")
     )
     sections.append(Text("Issues", style="bold bright_white"))
-    sections.append(build_issues_table(group, issue_offset))
+    sections.append(build_issues_table(group, issue_offset, show_assignee))
     sections.append(Text("Agents", style="bold bright_white"))
     sections.append(build_agents_table(group))
     body = Group(*sections)
@@ -1228,6 +1236,7 @@ def build_dashboard(
     expanded_prs: set[int] | None = None,
     selected_pr: int | None = None,
     issue_offsets: dict[str, int] | None = None,
+    width: int = ISSUE_ASSIGNEE_MIN_WIDTH,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1248,6 +1257,7 @@ def build_dashboard(
                 expanded_prs,
                 selected_pr,
                 (issue_offsets or {}).get(group.project.name, 0),
+                width >= ISSUE_ASSIGNEE_MIN_WIDTH,
             )
             for group in project_runs
         ],
@@ -1419,6 +1429,7 @@ def run_monitor(
                             if selected and selected.kind == "pr" and selected.pr
                             else None,
                             issue_offsets,
+                            console.width,
                         )
                     )
 
