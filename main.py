@@ -39,6 +39,8 @@ ISSUE_PAGE_SIZE = 8  # most issue rows per project; fewer when the terminal is s
 ISSUE_MIN_PAGE_SIZE = 3  # kept even when the dashboard then overflows the terminal
 PR_PAGE_SIZE = 10  # most pull request rows per project
 PR_MIN_PAGE_SIZE = 3
+AGENT_PAGE_SIZE = 12  # most agent rows per project; the rest collapse into "… N more"
+AGENT_MIN_PAGE_SIZE = 3
 # Below this width the assignee column is dropped to leave room for titles.
 ISSUE_ASSIGNEE_MIN_WIDTH = 110
 SETTINGS_FILE_NAME = "settings.toml"
@@ -1197,8 +1199,9 @@ def build_issues_table(
     return table
 
 
-def build_agents_table(group: ProjectRuns) -> Table | Text:
-    rows = build_agent_rows(group)
+def build_agents_table(group: ProjectRuns, page_size: int = AGENT_PAGE_SIZE) -> Table | Text:
+    all_rows = build_agent_rows(group)
+    rows = all_rows[:page_size]
     if not rows:
         return Text("No worktrees or PR branches.", style="dim")
 
@@ -1226,6 +1229,9 @@ def build_agents_table(group: ProjectRuns) -> Table | Text:
         origin = Text("worktree" if row.is_worktree else "remote", style="dim")
         table.add_row(marker, name, Text(test_label, style=test_style), pr_cell, detail, origin)
 
+    if len(all_rows) > len(rows):
+        table.add_row("", Text(f"… {len(all_rows) - len(rows)} more", style="dim"), "", "", "", "")
+
     return table
 
 
@@ -1239,6 +1245,7 @@ def build_project_panel(
     issue_page_size: int = ISSUE_PAGE_SIZE,
     pr_offset: int = 0,
     pr_page_size: int = PR_PAGE_SIZE,
+    agent_page_size: int = AGENT_PAGE_SIZE,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
     sections.append(Text("Runs", style="bold bright_white"))
@@ -1253,7 +1260,7 @@ def build_project_panel(
     sections.append(Text("Issues", style="bold bright_white"))
     sections.append(build_issues_table(group, issue_offset, show_assignee, issue_page_size))
     sections.append(Text("Agents", style="bold bright_white"))
-    sections.append(build_agents_table(group))
+    sections.append(build_agents_table(group, agent_page_size))
     body = Group(*sections)
 
     border_style = "yellow" if any(is_active(run) for run in group.runs) else "bright_black"
@@ -1277,6 +1284,7 @@ def build_dashboard(
     issue_page_size: int = ISSUE_PAGE_SIZE,
     pr_offsets: dict[str, int] | None = None,
     pr_page_size: int = PR_PAGE_SIZE,
+    agent_page_size: int = AGENT_PAGE_SIZE,
 ) -> Group:
     header = Text()
     header.append("GitHub Actions Monitor", style="bold bright_white")
@@ -1301,6 +1309,7 @@ def build_dashboard(
                 issue_page_size,
                 (pr_offsets or {}).get(group.project.name, 0),
                 pr_page_size,
+                agent_page_size,
             )
             for group in project_runs
         ],
@@ -1438,31 +1447,33 @@ def main(
 
 
 def fit_page_sizes(
-    console: Console, build: Callable[[int, int], Group]
-) -> tuple[int, int]:
-    """Pull request and issue rows per project that keep the dashboard on screen.
+    console: Console, build: Callable[[int, int, int], Group]
+) -> tuple[int, int, int]:
+    """Pull request, issue and agent rows per project that keep the dashboard on screen.
 
-    Starts both lists at their minimum, which is kept even when that already
+    Starts every list at its minimum, which is kept even when that already
     overflows, then grows them in turn while the dashboard still fits.
     """
+    maximums = (PR_PAGE_SIZE, ISSUE_PAGE_SIZE, AGENT_PAGE_SIZE)
+    sizes = [PR_MIN_PAGE_SIZE, ISSUE_MIN_PAGE_SIZE, AGENT_MIN_PAGE_SIZE]
 
-    def fits(pr_page: int, issue_page: int) -> bool:
-        return len(console.render_lines(build(pr_page, issue_page), pad=False)) <= console.height
+    def fits(candidate: list[int]) -> bool:
+        return len(console.render_lines(build(*candidate), pad=False)) <= console.height
 
-    pr_page, issue_page = PR_MIN_PAGE_SIZE, ISSUE_MIN_PAGE_SIZE
-    if not fits(pr_page, issue_page):
-        return pr_page, issue_page
+    if not fits(sizes):
+        return tuple(sizes)  # type: ignore[return-value]
 
     grew = True
     while grew:
         grew = False
-        if pr_page < PR_PAGE_SIZE and fits(pr_page + 1, issue_page):
-            pr_page += 1
-            grew = True
-        if issue_page < ISSUE_PAGE_SIZE and fits(pr_page, issue_page + 1):
-            issue_page += 1
-            grew = True
-    return pr_page, issue_page
+        for i, maximum in enumerate(maximums):
+            if sizes[i] < maximum:
+                bigger = sizes.copy()
+                bigger[i] += 1
+                if fits(bigger):
+                    sizes = bigger
+                    grew = True
+    return tuple(sizes)  # type: ignore[return-value]
 
 
 def pr_offsets_following(
@@ -1510,7 +1521,7 @@ def run_monitor(
                     rows = selectable_rows(groups, expanded_prs)
                     selected = rows[cursor] if rows else None
 
-                    def build(pr_page: int, page_size: int) -> Group:
+                    def build(pr_page: int, page_size: int, agent_page: int) -> Group:
                         return build_dashboard(
                             groups,
                             now,
@@ -1527,13 +1538,14 @@ def run_monitor(
                             page_size,
                             pr_offsets_following(groups, pr_offsets, selected, pr_page),
                             pr_page,
+                            agent_page,
                         )
 
-                    pr_page, issue_page = fit_page_sizes(console, build)
+                    pr_page, issue_page, agent_page = fit_page_sizes(console, build)
                     pr_offsets.update(
                         pr_offsets_following(groups, pr_offsets, selected, pr_page)
                     )
-                    live.update(build(pr_page, issue_page))
+                    live.update(build(pr_page, issue_page, agent_page))
 
                 rows = selectable_rows(groups, expanded_prs)
                 if rows:
