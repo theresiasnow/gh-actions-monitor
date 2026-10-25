@@ -978,7 +978,6 @@ def build_runs_table(
     selected_id: int | None = None,
     offset: int = 0,
     page_size: int = RUN_PAGE_SIZE,
-    focused: bool = False,
 ) -> Table | Text:
     if group.error:
         return Text(group.error, style="red")
@@ -1019,7 +1018,7 @@ def build_runs_table(
         table.add_row(
             "",
             "",
-            Text(f"{offset + 1}–{last} of {len(runs)}  {scroll_hint(focused)}", style="dim"),
+            Text(f"{offset + 1}–{last} of {len(runs)}  ↑/↓ scroll", style="dim"),
             "",
             "",
             "",
@@ -1036,7 +1035,6 @@ def build_prs_table(
     selected_id: int | None = None,
     pr_offset: int = 0,
     page_size: int = PR_PAGE_SIZE,
-    focused: bool = False,
 ) -> Table | Text | None:
     if group.pr_error:
         return Text(f"PRs: {group.pr_error}", style="red")
@@ -1143,7 +1141,7 @@ def build_prs_table(
             "",
             "",
             "",
-            Text(f"{pr_offset + 1}–{last} of {len(prs)}  {scroll_hint(focused)}", style="dim"),
+            Text(f"{pr_offset + 1}–{last} of {len(prs)}  ↑/↓ scroll", style="dim"),
             "",
             "",
             "",
@@ -1166,7 +1164,7 @@ def scroll_to(offset: int, index: int, page_size: int) -> int:
 
 
 def scroll_hint(focused: bool) -> str:
-    return "↑/↓ scroll" if focused else "Tab to scroll"
+    return "PgUp/PgDn scroll" if focused else "Tab to scroll"
 
 
 def build_issues_table(
@@ -1303,20 +1301,12 @@ def build_project_panel(
     run_page_size: int = RUN_PAGE_SIZE,
 ) -> Panel:
     sections: list[Table | Text | Align] = []
-    sections.append(section_title("Runs", focus_kind == "runs"))
-    sections.append(
-        build_runs_table(group, selected_id, run_offset, run_page_size, focus_kind == "runs")
-    )
-    sections.append(section_title("Pull Requests", focus_kind == "prs"))
+    sections.append(Text("Runs", style="bold bright_white"))
+    sections.append(build_runs_table(group, selected_id, run_offset, run_page_size))
+    sections.append(Text("Pull Requests", style="bold bright_white"))
     sections.append(
         build_prs_table(
-            group,
-            expanded_prs,
-            selected_pr,
-            selected_id,
-            pr_offset,
-            pr_page_size,
-            focus_kind == "prs",
+            group, expanded_prs, selected_pr, selected_id, pr_offset, pr_page_size
         )
         or Text("No open pull requests.", style="dim")
     )
@@ -1367,6 +1357,7 @@ def build_dashboard(
     header.append("  Space expand", style="dim")
     header.append("  Enter logs", style="dim")
     header.append("  Tab pane", style="dim")
+    header.append("  PgUp/PgDn scroll", style="dim")
     header.append("  q quit", style="dim")
 
     panels = [
@@ -1555,29 +1546,15 @@ def fit_page_sizes(
 def focus_panes(
     groups: list[ProjectRuns], issue_page: int, agent_page: int
 ) -> list[tuple[str, str]]:
-    """Panes Tab can select: runs and PRs when present, issues and agents when too long."""
+    """Issue and agent lists too long to show in full, in Tab order."""
     panes: list[tuple[str, str]] = []
     for group in groups:
         name = group.project.name
-        if not group.error and standalone_runs(group):
-            panes.append(("runs", name))
-        if not group.pr_error and group.prs:
-            panes.append(("prs", name))
         if len(group.issues or []) > issue_page:
             panes.append(("issues", name))
         if len(build_agent_rows(group)) > agent_page:
             panes.append(("agents", name))
     return panes
-
-
-def pane_row_indices(rows: list[SelectableRow], kind: str, name: str) -> list[int]:
-    """Cursor stops belonging to a runs or PRs pane: standalone runs, or PRs and their runs."""
-    return [
-        i
-        for i, row in enumerate(rows)
-        if row.project.name == name
-        and ((kind == "runs" and row.pr is None) or (kind == "prs" and row.pr is not None))
-    ]
 
 
 def run_offsets_following(
@@ -1632,7 +1609,7 @@ def run_monitor(
     agent_offsets: dict[str, int] = {}
     issue_page = ISSUE_PAGE_SIZE
     agent_page = AGENT_PAGE_SIZE
-    focus: tuple[str, str] | None = None  # the pane ↑/↓ act on
+    focus: tuple[str, str] | None = None  # the pane PgUp/PgDn scroll
     expanded_prs: set[int] = set()
     groups: list[ProjectRuns] = []
 
@@ -1642,27 +1619,10 @@ def run_monitor(
                 groups = [fetch_project_runs(project, limit, pr_limit, issue_limit) for project in projects]
                 now = datetime.now().strftime("%H:%M:%S")
 
-                def settle_focus() -> None:
-                    """Keep focus on a pane that exists and the cursor inside it."""
-                    nonlocal focus, cursor
-                    panes = focus_panes(groups, issue_page, agent_page)
-                    if focus not in panes:
-                        focus = panes[0] if panes else None
-                    if focus and focus[0] in ("runs", "prs"):
-                        indices = pane_row_indices(
-                            selectable_rows(groups, expanded_prs), *focus
-                        )
-                        if indices and cursor not in indices:
-                            cursor = indices[0]
-
                 def render() -> None:
-                    nonlocal issue_page, agent_page
-                    settle_focus()
+                    nonlocal issue_page, agent_page, focus
                     rows = selectable_rows(groups, expanded_prs)
-                    # Only the focused runs or PRs pane shows the cursor.
-                    selected = (
-                        rows[cursor] if rows and focus and focus[0] in ("runs", "prs") else None
-                    )
+                    selected = rows[cursor] if rows else None
 
                     def build(run_page: int, pr_page: int, issues: int, agents: int) -> Group:
                         return build_dashboard(
@@ -1695,6 +1655,8 @@ def run_monitor(
                     run_offsets.update(
                         run_offsets_following(groups, run_offsets, selected, run_page)
                     )
+                    if focus not in focus_panes(groups, issue_page, agent_page):
+                        focus = None
                     live.update(build(run_page, pr_page, issue_page, agent_page))
 
                 rows = selectable_rows(groups, expanded_prs)
@@ -1706,21 +1668,18 @@ def run_monitor(
                 while time.monotonic() < deadline:
                     key = keys.read_key()
                     rows = selectable_rows(groups, expanded_prs)
-                    in_list = focus is not None and focus[0] in ("runs", "prs")
                     if key == "quit":
                         return
                     if key in ("tab", "back_tab"):
-                        panes = focus_panes(groups, issue_page, agent_page)
-                        if panes:
-                            index = panes.index(focus) if focus in panes else 0
-                            step = 1 if key == "tab" else -1
-                            focus = panes[(index + step) % len(panes)]
-                            if focus[0] in ("runs", "prs"):
-                                indices = pane_row_indices(rows, *focus)
-                                if indices:
-                                    cursor = indices[0]
-                            render()
-                    elif focus and not in_list and key in ("up", "down", "page_up", "page_down"):
+                        panes: list[tuple[str, str] | None] = [
+                            None,
+                            *focus_panes(groups, issue_page, agent_page),
+                        ]
+                        index = panes.index(focus) if focus in panes else 0
+                        step = 1 if key == "tab" else -1
+                        focus = panes[(index + step) % len(panes)]
+                        render()
+                    elif key in ("page_up", "page_down") and focus:
                         kind, name = focus
                         group = next((g for g in groups if g.project.name == name), None)
                         if group:
@@ -1728,21 +1687,16 @@ def run_monitor(
                             page = issue_page if issues else agent_page
                             offsets = issue_offsets if issues else agent_offsets
                             total = len(group.issues or []) if issues else len(build_agent_rows(group))
-                            step = page if key.startswith("page") else 1
-                            if key in ("up", "page_up"):
-                                step = -step
+                            step = page if key == "page_down" else -page
                             offsets[name] = clamp_offset(offsets.get(name, 0) + step, total, page)
                             render()
-                    elif in_list and key in ("up", "down") and focus:
-                        indices = pane_row_indices(rows, *focus)
-                        if key == "up":
-                            earlier = [i for i in indices if i < cursor]
-                            cursor = earlier[-1] if earlier else cursor
-                        else:
-                            later = [i for i in indices if i > cursor]
-                            cursor = later[0] if later else cursor
+                    elif key == "up" and rows:
+                        cursor = max(0, cursor - 1)
                         render()
-                    elif key == "toggle" and rows and in_list:
+                    elif key == "down" and rows:
+                        cursor = min(len(rows) - 1, cursor + 1)
+                        render()
+                    elif key == "toggle" and rows:
                         selected = rows[cursor]
                         number = selected.pr.get("number") if selected.pr else None
                         if isinstance(number, int):
@@ -1771,7 +1725,7 @@ def run_monitor(
                             if new_rows:
                                 cursor = min(cursor, len(new_rows) - 1)
                             render()
-                    elif key == "enter" and rows and in_list:
+                    elif key == "enter" and rows:
                         selected = rows[cursor]
                         if selected.kind == "run" and selected.run:
                             live.stop()
